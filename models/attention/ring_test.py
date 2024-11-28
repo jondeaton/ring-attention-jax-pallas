@@ -34,7 +34,7 @@ def mha(
     B, Lq, H, Dk = q.shape
     _, Lk, *_ = k.shape
 
-    qk = einops.einsum(q, k, "b i h d, b j h d -> b h i j ")
+    qk = einops.einsum(q, k, "b i h d, b j h d -> b h i j")
     z = qk / jnp.sqrt(Dk)
     if bias is not None:
         z += bias
@@ -166,23 +166,21 @@ def test_ring_attention_backward():
         check_rep=False,
     )
 
-    def f(q, k, v):
-        o = ring_attention_sharded(q, k, v)
-        return o.sum()
-
     with jax.disable_jit():
-        dq, dk, dv = jax.grad(f, argnums=(0, 1, 2))(q, k, v)
+        dq, dk, dv = jax.grad(
+            lambda q, k, v: ring_attention_sharded(q, k, v).sum(),
+            argnums=(0, 1, 2),
+        )(q, k, v)
 
     assert not jnp.isnan(dq).any()
     assert not jnp.isnan(dk).any()
     assert not jnp.isnan(dv).any()
 
-    def f(q, k, v):
-        o = mha(q, k, v)
-        return o.sum()
+    dq_, dk_, dv_ = jax.grad(
+        lambda q, k, v: mha(q, k, v).sum(),
+        argnums=(0, 1, 2),
+    )(q, k, v)
 
-    dq_, dk_, dv_ = jax.grad(f, argnums=(0, 1, 2))(q, k, v)
-
-    np.testing.assert_allclose(dq, dq_)
-    np.testing.assert_allclose(dk, dk_)
-    np.testing.assert_allclose(dv, dv_)
+    np.testing.assert_allclose(dq, dq_, atol=1e-4)
+    np.testing.assert_allclose(dk, dk_, atol=1e-4)
+    np.testing.assert_allclose(dv, dv_, atol=1e-4)

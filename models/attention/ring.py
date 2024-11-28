@@ -13,12 +13,12 @@ import math
 import functools
 import einops
 
-from jaxtyping import Float, Int, Array, PRNGKeyArray
+from jaxtyping import Float, Int, Array, PRNGKeyArray, PyTree
 
 from einops import rearrange, repeat
 
 
-def rotate_block(x: jax.Array, axis_name: str, axis_size: int) -> jax.Array:
+def rotate_block(x: PyTree, axis_name: str, axis_size: int) -> PyTree:
     """Rotates an array block (ie key/query block) along the axis.
 
     Args:
@@ -64,8 +64,7 @@ def _ring_attention_fwd(
         pv = einops.einsum(p, v, "b h lq lk, b h lk dv -> b h lq dv")
         o = o / jnp.exp(m_prev - m)[..., None] + pv
 
-        k = rotate(k)
-        v = rotate(v)
+        k, v = rotate([k, v])
         return (o, l, m, k, v), None
 
     # Loop state initialization.
@@ -95,43 +94,37 @@ def _ring_attention_bwd(axis_name: str, res, do):
 
     # TODO: get this number without doing a collective op?
     axis_size = jax.lax.psum(1, axis_name)
-
     rotate = functools.partial(rotate_block, axis_name=axis_name, axis_size=axis_size)
 
-    def scan_fn(carry, i: Int):
-        q, k, v, o, dq, dk, dv, do, L = carry
+    sm_scale = 1 / math.sqrt(dim_k)
 
-        s = einops.einsum(q, k, "b h lq dk, b h lk dk -> b h lq lk") / math.sqrt(dim_k)
+    def scan_fn(carry, i: Int):
+        q, o, dq, dk, dv, do, L = carry
+
+        s = einops.einsum(q, k, "b h lq dk, b h lk dk -> b h lq lk") * sm_scale
         p: Float[Array, "b h lq lk"] = jnp.exp(s - L[..., None])
 
         dv += einops.einsum(p, do, "b h lq lk, b h lq dv -> b h lk dv")
-        dp = einops.einsum(do, v, "b h lq dv, b h lk dv -> b h lq lk")
 
-        delta = einops.einsum(do, o, "b h lq dv, b h lq dv -> b h lq")
-        ds: Float[Array, "b h lq lk"] = p * (dp - delta[:, :, :, None])
+        dp = einops.einsum(do, v, "b h lq dv, b h lk dv -> b h lq lk")
+        delta: Float[Array, "b h lq 1"] = jnp.sum(do * o, keepdims=True, axis=-1)
+        ds: Float[Array, "b h lq lk"] = p * (dp - delta) * sm_scale
 
         dq += einops.einsum(ds, k, "b h lq lk, b h lk dk -> b h lq dk")
         dk += einops.einsum(ds, q, "b h lq lk, b h lq dk -> b h lk dk")
 
-        q = rotate(q)
-        dq = rotate(dq)
-        o = rotate(o)
-        do = rotate(do)
-        L = rotate(L)
-
-        return (q, k, v, o, dq, dk, dv, do, L), None
+        q, o, dq, do, L = rotate([q, o, dq, do, L])
+        return (q, o, dq, dk, dv, do, L), None
 
     dq = jnp.zeros(shape=(batch, num_heads, q_len, dim_k), dtype=q.dtype)
     dk = jnp.zeros(shape=(batch, num_heads, kv_len, dim_k), dtype=k.dtype)
     dv = jnp.zeros(shape=(batch, num_heads, kv_len, dim_v), dtype=v.dtype)
 
-    (q, k, v, o, dq, dk, dv, do, _), _ = jax.lax.scan(
+    (q, o, dq, dk, dv, do, _), _ = jax.lax.scan(
         scan_fn,
-        init=(q, k, v, o, dq, dk, dv, do, L),
+        init=(q, o, dq, dk, dv, do, L),
         xs=jnp.arange(axis_size),
     )
-
-    dq = rotate(dq)  # final rotation to get gradients of current block's querries.
 
     dq = einops.rearrange(dq, "b h l d -> b l h d")
     dk = einops.rearrange(dk, "b h l d -> b l h d")
