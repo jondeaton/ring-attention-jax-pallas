@@ -3,10 +3,12 @@
 https://github.com/haoliuhl/ringattention/blob/main/ringattention/ringattention_jax.py
 """
 
+from __future__ import annotations
 from typing import Any
 
 import jax
 import jax.numpy as jnp
+import math
 
 import functools
 import einops
@@ -16,552 +18,127 @@ from jaxtyping import Float, Int, Array, PRNGKeyArray
 from einops import rearrange, repeat
 
 
+def rotate_block(x: jax.Array, axis_name: str, axis_size: int) -> jax.Array:
+    """Rotates an array block (ie key/query block) along the axis.
+
+    Args:
+        x: array block to rotate
+        axis_name: the name of the axis along which the array is sharded.
+        axis_size: number of blocks/shards/slices that cut the axis.
+    Returns:
+        rotated block same shape as input block.
+    """
+    return jax.lax.ppermute(
+        x,
+        axis_name,
+        perm=[(i, (i + 1) % axis_size) for i in range(axis_size)],
+    )
+
+
 def _ring_attention_fwd(
-    q: Float[Array, "B Lq H D"],
-    k: Float[Array, "B Lk H D"],
-    v: Float[Array, "B Lk H D"],
-    attn_bias: Float[Array, "B Lq Lk"],
-    segment_ids: Int[Array, "B Lq "],
-    cache_idx: int | None,
+    q: Float[Array, "b lq h dk"],
+    k: Float[Array, "b lk h dk"],
+    v: Float[Array, "b lk h dv"],
     axis_name: str,
-    float32_logits: bool,
-    blockwise_kwargs: dict[str, Any],
-):
-    if float32_logits:
-        q = q.astype(jnp.float32)
-        k = k.astype(jnp.float32)
+) -> tuple[Float[Array, "b lq h dv"], tuple]:
+    batch, q_len, num_heads, dk = q.shape
+    batch, kv_len, _, _ = k.shape
+    dv = v.shape[-1]
 
-    batch, q_len, num_heads, dim_per_head = q.shape
-    batch, kv_len, num_heads, dim_per_head = k.shape
-    numerator = jnp.zeros((batch, q_len, num_heads, dim_per_head)).astype(q.dtype)
-    denominator = jnp.zeros((batch, num_heads, q_len)).astype(q.dtype)
+    # TODO: get this number without doing a collective op?
+    axis_size = jax.lax.psum(1, axis_name)
+    rotate = functools.partial(rotate_block, axis_name=axis_name, axis_size=axis_size)
+
+    def scan_fn(carry, i: Int):
+        o, l, m_prev, k, v = carry
+
+        s = einops.einsum(q, k, "b lq h dk, b lk h dk -> b h lq lk") / math.sqrt(dk)
+        m = jnp.maximum(m_prev, jnp.max(s, axis=-1))
+        p = jnp.exp(s - m[..., None])
+        l = jnp.exp(m_prev - m) * l + jnp.sum(p, axis=-1)
+        pv = einops.einsum(p, v, "b h lq lk, b lk h dv -> b h lq dv")
+        o = o / jnp.exp(m_prev - m)[..., None] + pv
+
+        k = rotate(k)
+        v = rotate(v)
+        return (o, l, m, k, v), None
+
+    # Loop state initialization.
+    o = jnp.zeros(shape=(batch, num_heads, q_len, dv), dtype=v.dtype)
+    l = jnp.zeros(shape=(batch, num_heads, q_len), dtype=q.dtype)
+    m = jnp.zeros(shape=(batch, num_heads, q_len), dtype=q.dtype)
+    (o, l, m, _, _), _ = jax.lax.scan(
+        scan_fn,
+        init=(o, l, m, k, v),
+        xs=jnp.arange(axis_size),
+    )
+    o = o / l[..., None]
+    L: Float[Array, "b h lq"] = m + jnp.log(l)
+    res = q, k, v, o, L  # for backwards pass
+    return einops.rearrange(o, "b h l d -> b l h d"), res
+
+
+def _ring_attention_bwd(axis_name: str, res, do):
+    q, k, v, o, L = res
+
+    batch, q_len, num_heads, dk = q.shape
+    batch, kv_len, _, _ = k.shape
+    dv = v.shape[-1]
+
+    # TODO: get this number without doing a collective op?
     axis_size = jax.lax.psum(1, axis_name)
 
-    # assumes this function is pre-sharded inside shard_map
-    q_block_size = q_len
-    kv_block_size = kv_len
+    rotate = functools.partial(rotate_block, axis_name=axis_name, axis_size=axis_size)
 
-    query_chunk_size = blockwise_kwargs["query_chunk_size"]
-    key_chunk_size = blockwise_kwargs["key_chunk_size"]
+    def scan_fn(carry, i: Int):
+        q, k, v, o, dq, dk, dv, do, L = carry
 
-    def scan_kv_block(carry, idx):
-        prev_max_score, numerator, denominator, k, v = carry
-        if cache_idx is None:
-            q_block_idx = jax.lax.axis_index(axis_name)
-            q_chunk_idx_start = q_block_idx * (q_block_size // query_chunk_size)
-        else:
-            q_chunk_idx_start = cache_idx // query_chunk_size
-        k_block_idx = (jax.lax.axis_index(axis_name) - idx) % axis_size
-        k_chunk_idx_start = k_block_idx * (kv_block_size // key_chunk_size)
-        numerator, denominator, max_score = _blockwise_attention_fwd(
-            q,
-            k,
-            v,
-            (numerator, denominator, prev_max_score),
-            q_chunk_idx_start,
-            k_chunk_idx_start,
-            bias=attn_bias,
-            segment_ids=segment_ids,
-            cache_idx=cache_idx,
-            **blockwise_kwargs,
-        )
-        k, v = map(
-            lambda x: jax.lax.ppermute(
-                x, axis_name, perm=[(i, (i + 1) % axis_size) for i in range(axis_size)]
-            ),
-            (k, v),
-        )
-        return (max_score, numerator, denominator, k, v), None
+        s = einops.einsum(q, k, "b lq h dk, b lk h dk -> b h lq lk") / math.sqrt(dk)
+        p: Float[Array, "b h lq lk"] = jnp.exp(s - L[..., None])
+        dv += einops.einsum(p, do, "b h lq lk, b lq h dv -> b h lk dv")
+        dp = einops.einsum(do, v, "b lq h dv, b h lk dv -> b h lq lk")
 
-    prev_max_score = jnp.full((batch, num_heads, q_len), -jnp.inf).astype(q.dtype)
-    (max_score, numerator, denominator, _, _), _ = jax.lax.scan(
-        scan_kv_block,
-        init=(prev_max_score, numerator, denominator, k, v),
-        xs=jnp.arange(0, axis_size),
-    )
-    output = numerator / einops.rearrange(denominator, "b h q -> b q h")[..., None]
-    return output.astype(v.dtype), (
-        output,
-        q,
-        k,
-        v,
-        attn_bias,
-        segment_ids,
-        cache_idx,
-        denominator,
-        max_score,
+        D = jnp.sum(do * o, axis=2)
+        ds: Float[Array, "b h lq lk"] = p * (dp - D[:, :, None, :])
+
+        dq += einops.einsum(ds, k, "b h lq lk, b h lk dk -> b h lq dk")
+        dk += einops.einsum(ds, q, "b h lq lk, b h lq dk -> b h lk dk")
+
+        q = rotate(q)
+        dq = rotate(dq)
+        o = rotate(o)
+        do = rotate(do)
+        L = rotate(L)
+
+        return (q, k, v, o, dq, dk, dv, do, L), None
+
+    dq = jnp.zeros(shape=(batch, num_heads, q_len, dk), dtype=q.dtype)
+    dk = jnp.zeros(shape=(batch, num_heads, kv_len, dk), dtype=k.dtype)
+    dv = jnp.zeros(shape=(batch, num_heads, kv_len, dv), dtype=v.dtype)
+
+    (q, k, v, o, dq, dk, dv, do, _), _ = jax.lax.scan(
+        scan_fn,
+        init=(q, k, v, o, dq, dk, dv, do, L),
+        xs=jnp.arange(axis_size),
     )
 
+    dq = rotate(dq)  # final rotation to get gradients of this query block.
 
-def _ring_attention_bwd(
-    axis_name: str,
-    float32_logits: bool,
-    blockwise_kwargs: dict[str, Any],
-    res,
-    g,
-):
-    del float32_logits
-
-    output, q, k, v, attn_bias, segment_ids, cache_idx, denominator, max_score = res
-    batch, q_len, num_heads, dim_per_head = q.shape
-    batch, kv_len, num_heads, dim_per_head = k.shape
-
-    axis_size = jax.lax.psum(1, axis_name)
-    dq = jnp.zeros_like(q, dtype=q.dtype)
-    dk = jnp.zeros_like(k, dtype=k.dtype)
-    dv = jnp.zeros_like(v, dtype=k.dtype)
-    query_chunk_size = blockwise_kwargs["query_chunk_size"]
-    key_chunk_size = blockwise_kwargs["key_chunk_size"]
-    q_block_size, kv_block_size = (
-        q_len,
-        kv_len,
-    )  # assumes this function is pre-sharded inside shard_map
-
-    def scan_kv_block(carry, idx):
-        dq, dk, dv, k, v = carry
-        if cache_idx is None:
-            q_block_idx = jax.lax.axis_index(axis_name)
-            q_chunk_idx_start = q_block_idx * (q_block_size // query_chunk_size)
-        else:
-            q_chunk_idx_start = cache_idx // query_chunk_size
-        k_block_idx = (jax.lax.axis_index(axis_name) - idx) % axis_size
-        k_chunk_idx_start = k_block_idx * (kv_block_size // key_chunk_size)
-        dq, dk, dv = _blockwise_attention_bwd(
-            q,
-            k,
-            v,
-            g,
-            (dq, dk, dv, output, denominator, max_score),
-            q_chunk_idx_start,
-            k_chunk_idx_start,
-            bias=attn_bias,
-            segment_ids=segment_ids,
-            cache_idx=cache_idx,
-            **blockwise_kwargs,
-        )
-        k, v, dk, dv = map(
-            lambda x: jax.lax.ppermute(
-                x, axis_name, perm=[(i, (i + 1) % axis_size) for i in range(axis_size)]
-            ),
-            (k, v, dk, dv),
-        )
-        return (dq, dk, dv, k, v), None
-
-    (dq, dk, dv, k, v), _ = jax.lax.scan(
-        scan_kv_block, init=(dq, dk, dv, k, v), xs=jnp.arange(0, axis_size)
-    )
-    dq, dk, dv = dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(k.dtype)
-    return dq, dk, dv, None, None, None
-
-
-@functools.partial(jax.custom_vjp, nondiff_argnums=[6, 7, 8])
-def ring_attention(
-    q: Float[Array, "B Lq H D"],
-    k: Float[Array, "B Lk H D"],
-    v: Float[Array, "B Lk H D"],
-    attn_bias: Float[Array, "B Lq Lk"],
-    segment_ids: Int[Array, "B Lq "],
-    blockwise_kwargs: dict[str, Any],
-    float32_logits: bool = True,
-    cache_idx: int | None = None,
-    axis_name: str = "sp",
-) -> Float[Array, "B Lq H D"]:
-    y, _ = _ring_attention_fwd(
-        q,
-        k,
-        v,
-        attn_bias,
-        segment_ids,
-        cache_idx=cache_idx,
-        axis_name=axis_name,
-        float32_logits=float32_logits,
-        blockwise_kwargs=blockwise_kwargs,
-    )
-    return y
-
-
-ring_attention.defvjp(_ring_attention_fwd, _ring_attention_bwd)
-
-
-def _blockwise_attention_fwd(
-    q,
-    k,
-    v,
-    carry,
-    q_chunk_idx_start,
-    k_chunk_idx_start,
-    bias,
-    segment_ids,
-    causal_block_size,
-    query_chunk_size,
-    key_chunk_size,
-    deterministic,
-    dropout_rng,
-    attn_pdrop,
-    dtype,
-    policy,
-    precision,
-    prevent_cse,
-    cache_idx,
-):
-    batch, q_len, num_heads, dim_per_head = q.shape
-    batch, kv_len, num_heads, dim_per_head = k.shape
-    batch, kv_len, num_heads, dim_per_head = v.shape
-    num_q = q_len // query_chunk_size
-    num_kv = kv_len // key_chunk_size
-    q = q.reshape((batch, num_q, query_chunk_size, num_heads, dim_per_head))
-    k = k.reshape((batch, num_kv, key_chunk_size, num_heads, dim_per_head))
-    v = v.reshape((batch, num_kv, key_chunk_size, num_heads, dim_per_head))
-    q, k, v = map(lambda x: jnp.moveaxis(x, 1, 0), (q, k, v))
-
-    numerator, denominator, max_score = carry
-    numerator = numerator.reshape(
-        (batch, num_q, query_chunk_size, num_heads, dim_per_head)
-    )
-    numerator = jnp.moveaxis(numerator, 1, 0)
-    denominator = denominator.reshape((batch, num_heads, num_q, query_chunk_size))
-    max_score = max_score.reshape((batch, num_heads, num_q, query_chunk_size))
-    denominator, max_score = map(
-        lambda x: einops.rearrange(x, "b h n c -> n b h c"), (denominator, max_score)
-    )
-
-    scale = jnp.sqrt(q.shape[-1])
-    if not deterministic and attn_pdrop > 0.0:
-        attn_dropout_rng, dropout_rng = jax.random.split(dropout_rng)
-        attn_dropout = jax.random.bernoulli(
-            attn_dropout_rng, attn_pdrop, (batch, num_heads, q_len, kv_len)
-        )
-    else:
-        attn_dropout = None
-    _chunk_bias_fn = functools.partial(
-        _chunk_attention_bias,
-        query_chunk_size,
-        key_chunk_size,
-        bias,
-        segment_ids,
-        deterministic,
-        attn_dropout,
-        attn_pdrop,
-        causal_block_size,
-        dtype,
-    )
-
-    def scan_attention(_, scan):
-        q_chunk, numerator_chunk, denominator_chunk, max_score_chunk, q_chunk_idx = scan
-
-        @functools.partial(jax.checkpoint, prevent_cse=prevent_cse, policy=policy)
-        def scan_kv_block(carry, scan):
-            k_chunk, value_chunk, k_chunk_idx = scan
-            numerator_chunk, denominator_chunk, prev_max_score_chunk = carry
-            attn_weights = (
-                jnp.einsum("bqhd,bkhd->bhqk", q_chunk, k_chunk, precision=precision)
-                / scale
-            )
-            bias_chunk = _chunk_bias_fn(
-                q_chunk_idx_start + q_chunk_idx, k_chunk_idx_start + k_chunk_idx
-            )
-            attn_weights = attn_weights + bias_chunk
-
-            max_score_chunk = jnp.maximum(
-                prev_max_score_chunk, jnp.max(attn_weights, axis=-1)
-            )
-            max_score_chunk = jax.lax.stop_gradient(max_score_chunk)
-            exp_weights = jnp.exp(attn_weights - max_score_chunk[..., None])
-            exp_values = jnp.einsum(
-                "bhqk,bkhd->bqhd", exp_weights, value_chunk, precision=precision
-            )
-            correction = einops.rearrange(
-                jnp.exp(prev_max_score_chunk - max_score_chunk), "b h q -> b q h 1"
-            )
-            numerator_chunk = numerator_chunk * correction + exp_values
-            denominator_chunk = denominator_chunk * jnp.exp(
-                prev_max_score_chunk - max_score_chunk
-            ) + exp_weights.sum(axis=-1)
-            return (numerator_chunk, denominator_chunk, max_score_chunk), None
-
-        def skip_upper_half(carry, args):
-            key_chunk, value_chunk, k_chunk_idx = args
-            should_run = jnp.array(True)
-            if causal_block_size is not None:
-                should_run = below_or_on_diag(
-                    q_chunk_idx_start + q_chunk_idx,
-                    query_chunk_size,
-                    k_chunk_idx_start + k_chunk_idx,
-                    key_chunk_size,
-                    causal_block_size,
-                )
-            return jax.lax.cond(
-                should_run,
-                scan_kv_block,
-                lambda carry, args: (carry, None),
-                carry,
-                args,
-            )
-
-        (numerator_chunk, denominator_chunk, max_score_chunk), _ = jax.lax.scan(
-            skip_upper_half,
-            init=(numerator_chunk, denominator_chunk, max_score_chunk),
-            xs=(k, v, jnp.arange(0, num_kv)),
-        )
-        output_chunk = numerator_chunk / einops.rearrange(
-            denominator_chunk, "b h q -> b q h 1"
-        ).astype(dtype)
-        return (), (output_chunk, numerator_chunk, denominator_chunk, max_score_chunk)
-
-    _, (_, numerator, denominator, max_score) = jax.lax.scan(
-        scan_attention,
-        init=(),
-        xs=(q, numerator, denominator, max_score, jnp.arange(0, num_q)),
-    )
-
-    numerator = jnp.moveaxis(numerator, 1, 0)
-    numerator = numerator.reshape((batch, q_len, num_heads, dim_per_head))
-    denominator, max_score = map(
-        lambda x: einops.rearrange(x, "n b h c -> b h n c"), (denominator, max_score)
-    )
-    denominator = denominator.reshape((batch, num_heads, q_len))
-    max_score = max_score.reshape((batch, num_heads, q_len))
-
-    return numerator, denominator, max_score
-
-
-def _blockwise_attention_bwd(
-    q,
-    k,
-    v,
-    g,
-    carry,
-    q_chunk_idx_start,
-    k_chunk_idx_start,
-    bias,
-    segment_ids,
-    causal_block_size,
-    query_chunk_size,
-    key_chunk_size,
-    deterministic,
-    dropout_rng,
-    attn_pdrop,
-    dtype,
-    policy,
-    precision,
-    prevent_cse,
-    cache_idx,
-):
-    batch, q_len, num_heads, dim_per_head = q.shape
-    batch, kv_len, num_heads, dim_per_head = k.shape
-    batch, kv_len, num_heads, dim_per_head = v.shape
-    num_q = q_len // query_chunk_size
-    num_kv = kv_len // key_chunk_size
-    dq, dk, dv, output, denominator, max_score = carry
-
-    g = g.reshape((batch, num_q, query_chunk_size, num_heads, dim_per_head))
-    dq = dq.reshape((batch, num_q, query_chunk_size, num_heads, dim_per_head))
-    dk = dk.reshape((batch, num_kv, key_chunk_size, num_heads, dim_per_head))
-    dv = dv.reshape((batch, num_kv, key_chunk_size, num_heads, dim_per_head))
-    output = output.reshape((batch, num_q, query_chunk_size, num_heads, dim_per_head))
-    g, dq, dk, dv, output = map(
-        lambda x: jnp.moveaxis(x, 1, 0), (g, dq, dk, dv, output)
-    )
-
-    denominator = denominator.reshape((batch, num_heads, num_q, query_chunk_size))
-    max_score = max_score.reshape((batch, num_heads, num_q, query_chunk_size))
-    denominator, max_score = map(
-        lambda x: rearrange(x, "b h n c -> n b h c"), (denominator, max_score)
-    )
-
-    q = q.reshape((batch, num_q, query_chunk_size, num_heads, dim_per_head))
-    k = k.reshape((batch, num_kv, key_chunk_size, num_heads, dim_per_head))
-    v = v.reshape((batch, num_kv, key_chunk_size, num_heads, dim_per_head))
-    q, k, v = map(lambda x: jnp.moveaxis(x, 1, 0), (q, k, v))
-
-    scale = jnp.sqrt(q.shape[-1])
-    if not deterministic and attn_pdrop > 0.0:
-        attn_dropout_rng, dropout_rng = jax.random.split(dropout_rng)
-        attn_dropout = jax.random.bernoulli(
-            attn_dropout_rng, attn_pdrop, (batch, num_heads, q_len, kv_len)
-        )
-    else:
-        attn_dropout = None
-    _chunk_bias_fn = functools.partial(
-        _chunk_attention_bias,
-        query_chunk_size,
-        key_chunk_size,
-        bias,
-        segment_ids,
-        deterministic,
-        attn_dropout,
-        attn_pdrop,
-        causal_block_size,
-        dtype,
-    )
-
-    def scan_attention(carry, scan):
-        dk, dv = carry
-        (
-            q_chunk,
-            dq_chunk,
-            g_chunk,
-            output_chunk,
-            denominator_chunk,
-            max_score_chunk,
-            q_chunk_idx,
-        ) = scan
-        dl_part = jnp.einsum("bqhd,bqhd->bhq", g_chunk, output_chunk)[..., None]
-
-        @functools.partial(jax.checkpoint, prevent_cse=prevent_cse, policy=policy)
-        def scan_kv_block(carry, scan):
-            k_chunk, value_chunk, k_chunk_idx = scan
-            dq_chunk = carry
-            attn_weights = (
-                jnp.einsum("bqhd,bkhd->bhqk", q_chunk, k_chunk, precision=precision)
-                / scale
-            )
-            bias_chunk = _chunk_bias_fn(
-                q_chunk_idx_start + q_chunk_idx, k_chunk_idx_start + k_chunk_idx
-            )
-            attn_weights = attn_weights + bias_chunk
-            exp_weights = (
-                jnp.exp(attn_weights - max_score_chunk[..., None])
-                / denominator_chunk[..., None]
-            )
-
-            ds = jnp.einsum("bqhd,bkhd->bhqk", g_chunk, value_chunk)
-            dl = (ds - dl_part) * exp_weights
-            dq_chunk = dq_chunk + jnp.einsum("bhqk,bkhd->bqhd", dl, k_chunk) / scale
-            dk_chunk = jnp.einsum("bqhd,bhqk->bkhd", q_chunk, dl) / scale
-            dv_chunk = jnp.einsum("bhqk,bqhd->bkhd", exp_weights, g_chunk)
-            return dq_chunk, (dk_chunk, dv_chunk)
-
-        def skip_upper_half(carry, args):
-            key_chunk, value_chunk, k_chunk_idx = args
-            should_run = jnp.array(True)
-            if causal_block_size is not None:
-                should_run = below_or_on_diag(
-                    q_chunk_idx_start + q_chunk_idx,
-                    query_chunk_size,
-                    k_chunk_idx_start + k_chunk_idx,
-                    key_chunk_size,
-                    causal_block_size,
-                )
-            return lax.cond(
-                should_run,
-                scan_kv_block,
-                lambda carry, args: (
-                    carry,
-                    (
-                        jnp.zeros(
-                            (batch, key_chunk_size, num_heads, dim_per_head),
-                            dtype=dk.dtype,
-                        ),
-                        jnp.zeros(
-                            (batch, key_chunk_size, num_heads, dim_per_head),
-                            dtype=dk.dtype,
-                        ),
-                    ),
-                ),
-                carry,
-                args,
-            )
-
-        dq_chunk, (dk_part, dv_part) = jax.lax.scan(
-            skip_upper_half, init=dq_chunk, xs=(k, v, jnp.arange(0, num_kv))
-        )
-        return (dk + dk_part, dv + dv_part), dq_chunk
-
-    (dk, dv), dq = jax.lax.scan(
-        scan_attention,
-        init=(dk, dv),
-        xs=(q, dq, g, output, denominator, max_score, jnp.arange(0, num_q)),
-    )
-
-    dq, dk, dv = map(lambda x: jnp.moveaxis(x, 1, 0), (dq, dk, dv))
-    dq = dq.reshape((batch, q_len, num_heads, dim_per_head))
-    dk = dk.reshape((batch, kv_len, num_heads, dim_per_head))
-    dv = dv.reshape((batch, kv_len, num_heads, dim_per_head))
-
+    dq = einops.rearrange(dq, "b h l d -> b l h d")
+    dk = einops.rearrange(dk, "b h l d -> b l h d")
+    dv = einops.rearrange(dv, "b h l d -> b l h d")
     return dq, dk, dv
 
 
-def _chunk_attention_bias(
-    query_chunk_size,
-    key_chunk_size,
-    bias,
-    segment_ids,
-    deterministic,
-    attn_dropout,
-    attn_pdrop,
-    causal_block_size,
-    dtype,
-    query_chunk_idx,
-    key_chunk_idx,
-):
-    query_offset = query_chunk_idx * query_chunk_size
-    key_offset = key_chunk_idx * key_chunk_size
-    chunk_bias = jnp.zeros((1, 1, 1, 1), dtype=dtype)
-    if bias is not None:
-        chunk_bias = jax.lax.dynamic_slice(
-            bias,
-            start_indices=(0, 0, 0, key_offset),
-            slice_sizes=(
-                *bias.shape[:2],
-                min(bias.shape[-2], query_chunk_size),
-                min(bias.shape[-1], key_chunk_size),
-            ),
-        )
-
-    if segment_ids is not None:
-        q_segment_ids = jax.lax.dynamic_slice(
-            segment_ids,
-            start_indices=(0, query_offset),
-            slice_sizes=(segment_ids.shape[0], query_chunk_size),
-        )
-        k_segment_ids = jax.lax.dynamic_slice(
-            segment_ids,
-            start_indices=(0, key_offset),
-            slice_sizes=(segment_ids.shape[0], key_chunk_size),
-        )
-        segment_ids_mask = ~jnp.equal(
-            q_segment_ids[:, :, None], k_segment_ids[:, None, :]
-        )
-        segment_ids_mask = segment_ids_mask[:, None]  # B1QK
-        segment_ids_bias = segment_ids_mask * jnp.finfo(dtype).min
-        chunk_bias = jnp.minimum(chunk_bias, segment_ids_bias)
-
-    if causal_block_size is not None:
-        query_idx = jax.lax.broadcasted_iota(
-            dtype=jnp.int32, shape=(query_chunk_size, 1), dimension=0
-        )
-        query_idx += query_offset
-        key_idx = jax.lax.broadcasted_iota(
-            dtype=jnp.int32, shape=(1, key_chunk_size), dimension=1
-        )
-        key_idx += key_offset
-        query_idx //= causal_block_size
-        key_idx //= causal_block_size
-        causal_mask_value = (query_idx < key_idx) * jnp.finfo(dtype).min
-        chunk_bias = jnp.minimum(
-            chunk_bias, causal_mask_value.reshape(1, 1, *causal_mask_value.shape)
-        )
-
-    if not deterministic and attn_pdrop > 0.0:
-        attn_dropout_slice = jax.lax.dynamic_slice(
-            attn_dropout,
-            start_indices=(0, 0, query_offset, key_offset),
-            slice_sizes=(
-                *attn_dropout.shape[:2],
-                min(attn_dropout.shape[-2], query_chunk_size),
-                min(attn_dropout.shape[-1], key_chunk_size),
-            ),
-        )
-        chunk_bias += attn_dropout_slice * jnp.finfo(dtype).min
-    return chunk_bias.astype(dtype)
+@functools.partial(jax.custom_vjp, nondiff_argnums=(3,))
+def ring_attention(
+    q: Float[Array, "b lq h dk"],
+    k: Float[Array, "b lk h dk"],
+    v: Float[Array, "b lk h dv"],
+    axis_name: str,
+) -> Float[Array, "b lq h dv"]:
+    o, _ = _ring_attention_fwd(q, k, v, axis_name)
+    return o
 
 
-def below_or_on_diag(r, r_blk_size, c, c_blk_size, causal_block_size):
-    # A block is considered below or on diagonal as long as the bottom left
-    # corner of the block is below or on diagonal.
-    causal_block_size_q = max(causal_block_size, r_blk_size)
-    causal_block_size_k = max(causal_block_size, c_blk_size)
-    r = jax.lax.div(r, causal_block_size_q // r_blk_size)
-    c = jax.lax.div(c, causal_block_size_k // c_blk_size)
-    return ((r + 1) * causal_block_size_q - 1) > (c * causal_block_size_k)
+ring_attention.defvjp(_ring_attention_fwd, _ring_attention_bwd)

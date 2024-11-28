@@ -1,21 +1,45 @@
 """Test for ring attention."""
 
+import pytest
 import os
-
+import functools
+import numpy as np
 
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec, NamedSharding
-import einops
-
-import functools
 from jax.experimental.shard_map import shard_map
 from jax.experimental import mesh_utils
 
+import einops
+from jaxtyping import Float, Int, Array, PRNGKeyArray
+
 from models.attention.ring import ring_attention
+
+# from models.attention.ringattention_jax import ring_attention
 
 flags = os.environ.get("XLA_FLAGS", "")
 os.environ["XLA_FLAGS"] = flags + " --xla_force_host_platform_device_count=8"
+
+
+# Reference implementations.
+def mha(
+    q: Float[Array, "B Lq H Dk"],
+    k: Float[Array, "B Lk H Dk"],
+    v: Float[Array, "B Lk H Dv"],
+    bias: Float[Array, "B H Lq Lk"] | None = None,
+) -> Float[Array, "B Lq H Dv"]:
+    """Batched multi-head attention."""
+
+    B, Lq, H, Dk = q.shape
+    _, Lk, *_ = k.shape
+
+    qk = einops.einsum(q, k, "b i h d, b j h d -> b h i j ")
+    z = qk / jnp.sqrt(Dk)
+    if bias is not None:
+        z += bias
+    a = jax.nn.softmax(z, axis=-1)
+    return einops.einsum(a, v, "b h i j, b j h d -> b i h d")
 
 
 def test_ring_attention_forward():
@@ -30,21 +54,29 @@ def test_ring_attention_forward():
 
     batch_size = 4
     length = 1024
-    d = 128
+    h = 4
+    d = 64
 
-    q = jax.random.normal(key, shape=(batch_size, length, d))
-    k = jax.random.normal(key, shape=(batch_size, length, d))
-    v = jax.random.normal(key, shape=(batch_size, length, d))
-    attn_bias = jax.random.normal(key, shape=(batch_size, length, length))
-    segment_ids = einops.repeat(jnp.arange(length) // 128, "l -> b l", b=batch_size)
+    q = jax.random.normal(key, shape=(batch_size, length, h, d))
+    k = jax.random.normal(key, shape=(batch_size, length, h, d))
+    v = jax.random.normal(key, shape=(batch_size, length, h, d))
+    attn_bias = jax.random.normal(key, shape=(batch_size, h, length, length))
+    # segment_ids = einops.repeat(jnp.arange(length) // 128, "l -> b l", b=batch_size)
+    segment_ids = einops.repeat(jnp.ones(length), "l -> b l", b=batch_size)
 
-    sharding = NamedSharding(mesh, PartitionSpec(None, "sp", None))
+    sharding = NamedSharding(mesh, PartitionSpec(None, "sp"))
 
     q = jax.device_put(q, sharding)
     k = jax.device_put(k, sharding)
     v = jax.device_put(v, sharding)
-    attn_bias = jax.device_put(attn_bias, sharding)
-    segment_ids = jax.device_put(segment_ids, sharding)
+    attn_bias = jax.device_put(
+        attn_bias,
+        NamedSharding(mesh, PartitionSpec(None, None, "sp", None)),
+    )
+    segment_ids = jax.device_put(
+        segment_ids,
+        NamedSharding(mesh, PartitionSpec(None, "sp")),
+    )
 
     chunk_size = 32
 
@@ -52,30 +84,53 @@ def test_ring_attention_forward():
         functools.partial(
             ring_attention,
             axis_name="sp",
-            float32_logits=True,
-            cache_idx=None,
-            blockwise_kwargs=dict(
-                causal_block_size=1,
-                deterministic=True,
-                query_chunk_size=chunk_size,
-                key_chunk_size=chunk_size,
-                dtype=jnp.float32,
-                policy=jax.checkpoint_policies.nothing_saveable,
-                precision=jnp.float32,
-                prevent_cse=False,
-            ),
+            # float32_logits=True,
+            # cache_idx=None,
+            # blockwise_kwargs=dict(
+            #     causal_block_size=1,
+            #     deterministic=True,
+            #     dropout_rng=key,
+            #     attn_pdrop=0.0,
+            #     query_chunk_size=chunk_size,
+            #     key_chunk_size=chunk_size,
+            #     dtype=jnp.float32,
+            #     policy=jax.checkpoint_policies.nothing_saveable,
+            #     precision="float32",
+            #     prevent_cse=False,
+            # ),
         ),
         mesh=mesh,
         in_specs=(
             PartitionSpec("dp", "sp", None),  # q
             PartitionSpec("dp", "sp", None),  # k
             PartitionSpec("dp", "sp", None),  # v
-            PartitionSpec("dp", None, None, None),  #
-            PartitionSpec("dp", None),
+            # PartitionSpec("dp", None, "sp", None),  # attn attn_bias
+            # PartitionSpec("dp", "sp"),  # segment_ids
         ),
         out_specs=PartitionSpec("dp", "sp", None),
         check_rep=False,
     )
 
-    attn_output = ring_attention_sharded(q, k, v, attn_bias, segment_ids)
-    assert not jnp.isnan(attn_output).any()
+    with jax.disable_jit():
+        output = ring_attention_sharded(q, k, v)
+        # output = ring_attention_sharded(q, k, v, attn_bias, segment_ids)
+
+    assert not jnp.isnan(output).any()
+
+    # seg_mask = segment_ids[:, :, None] == segment_ids[:, None, :]
+    # seg_mask = einops.repeat(seg_mask, "B Lq Lk -> B H Lq Lk", H=h)
+    # bias = attn_bias + jnp.where(seg_mask, 0, -jnp.inf)
+    bias = None
+
+    reference = mha(q, k, v, bias=bias)
+
+    # TODO: next thing to try to solve this:
+    # why can't we just replace the inner attention with a simple attention?
+    # completely get rid of attention bias?
+
+    np.testing.assert_allclose(output, reference)
+
+
+def test_ring_attention_backward():
+    # TODO: test backwards pass
+    ...
