@@ -45,6 +45,10 @@ def _ring_attention_fwd(
     batch, kv_len, _, _ = k.shape
     dv = v.shape[-1]
 
+    q = einops.rearrange(q, "b l h d -> b h l d")
+    k = einops.rearrange(k, "b l h d -> b h l d")
+    v = einops.rearrange(v, "b l h d -> b h l d")
+
     # TODO: get this number without doing a collective op?
     axis_size = jax.lax.psum(1, axis_name)
     rotate = functools.partial(rotate_block, axis_name=axis_name, axis_size=axis_size)
@@ -52,11 +56,12 @@ def _ring_attention_fwd(
     def scan_fn(carry, i: Int):
         o, l, m_prev, k, v = carry
 
-        s = einops.einsum(q, k, "b lq h dk, b lk h dk -> b h lq lk") / math.sqrt(dk)
+        s = einops.einsum(q, k, "b h lq dk, b h lk dk -> b h lq lk") / math.sqrt(dk)
         m = jnp.maximum(m_prev, jnp.max(s, axis=-1))
         p = jnp.exp(s - m[..., None])
         l = jnp.exp(m_prev - m) * l + jnp.sum(p, axis=-1)
-        pv = einops.einsum(p, v, "b h lq lk, b lk h dv -> b h lq dv")
+
+        pv = einops.einsum(p, v, "b h lq lk, b h lk dv -> b h lq dv")
         o = o / jnp.exp(m_prev - m)[..., None] + pv
 
         k = rotate(k)
@@ -79,11 +84,14 @@ def _ring_attention_fwd(
 
 
 def _ring_attention_bwd(axis_name: str, res, do):
-    q, k, v, o, L = res
+    """Backwards pass for ring attention."""
 
-    batch, q_len, num_heads, dk = q.shape
-    batch, kv_len, _, _ = k.shape
-    dv = v.shape[-1]
+    q, k, v, o, L = res
+    do = einops.rearrange(do, "b l h d -> b h l d")
+
+    batch, num_heads, q_len, dim_k = q.shape
+    _, _, kv_len, dim_v = v.shape
+    assert k.shape == (batch, num_heads, kv_len, dim_k)
 
     # TODO: get this number without doing a collective op?
     axis_size = jax.lax.psum(1, axis_name)
@@ -93,13 +101,14 @@ def _ring_attention_bwd(axis_name: str, res, do):
     def scan_fn(carry, i: Int):
         q, k, v, o, dq, dk, dv, do, L = carry
 
-        s = einops.einsum(q, k, "b lq h dk, b lk h dk -> b h lq lk") / math.sqrt(dk)
+        s = einops.einsum(q, k, "b h lq dk, b h lk dk -> b h lq lk") / math.sqrt(dim_k)
         p: Float[Array, "b h lq lk"] = jnp.exp(s - L[..., None])
-        dv += einops.einsum(p, do, "b h lq lk, b lq h dv -> b h lk dv")
-        dp = einops.einsum(do, v, "b lq h dv, b h lk dv -> b h lq lk")
 
-        D = jnp.sum(do * o, axis=2)
-        ds: Float[Array, "b h lq lk"] = p * (dp - D[:, :, None, :])
+        dv += einops.einsum(p, do, "b h lq lk, b h lq dv -> b h lk dv")
+        dp = einops.einsum(do, v, "b h lq dv, b h lk dv -> b h lq lk")
+
+        delta = einops.einsum(do, o, "b h lq dv, b h lq dv -> b h lq")
+        ds: Float[Array, "b h lq lk"] = p * (dp - delta[:, :, :, None])
 
         dq += einops.einsum(ds, k, "b h lq lk, b h lk dk -> b h lq dk")
         dk += einops.einsum(ds, q, "b h lq lk, b h lq dk -> b h lk dk")
@@ -112,9 +121,9 @@ def _ring_attention_bwd(axis_name: str, res, do):
 
         return (q, k, v, o, dq, dk, dv, do, L), None
 
-    dq = jnp.zeros(shape=(batch, num_heads, q_len, dk), dtype=q.dtype)
-    dk = jnp.zeros(shape=(batch, num_heads, kv_len, dk), dtype=k.dtype)
-    dv = jnp.zeros(shape=(batch, num_heads, kv_len, dv), dtype=v.dtype)
+    dq = jnp.zeros(shape=(batch, num_heads, q_len, dim_k), dtype=q.dtype)
+    dk = jnp.zeros(shape=(batch, num_heads, kv_len, dim_k), dtype=k.dtype)
+    dv = jnp.zeros(shape=(batch, num_heads, kv_len, dim_v), dtype=v.dtype)
 
     (q, k, v, o, dq, dk, dv, do, _), _ = jax.lax.scan(
         scan_fn,
@@ -122,7 +131,7 @@ def _ring_attention_bwd(axis_name: str, res, do):
         xs=jnp.arange(axis_size),
     )
 
-    dq = rotate(dq)  # final rotation to get gradients of this query block.
+    dq = rotate(dq)  # final rotation to get gradients of current block's querries.
 
     dq = einops.rearrange(dq, "b h l d -> b l h d")
     dk = einops.rearrange(dk, "b h l d -> b l h d")
