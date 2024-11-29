@@ -120,7 +120,7 @@ def test_ring_attention_forward(seed: int, length: int, h: int, d: int):
     ],
 )
 def test_ring_attention_backward(seed: int, length: int, h: int, d: int):
-    key = jax.random.PRNGKey(0)
+    key = jax.random.PRNGKey(seed)
 
     devices = jax.devices()
     device_mesh = mesh_utils.create_device_mesh(

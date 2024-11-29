@@ -15,8 +15,6 @@ import einops
 
 from jaxtyping import Float, Int, Array, PRNGKeyArray, PyTree
 
-from einops import rearrange, repeat
-
 
 def rotate_block(x: PyTree, axis_name: str, axis_size: int) -> PyTree:
     """Rotates an array block (ie key/query block) along the axis.
@@ -40,6 +38,7 @@ def _ring_attention_fwd(
     k: Float[Array, "b lk h dk"],
     v: Float[Array, "b lk h dv"],
     axis_name: str,
+    sm_scale: float,
 ) -> tuple[Float[Array, "b lq h dv"], tuple]:
     batch, q_len, num_heads, dk = q.shape
     batch, kv_len, _, _ = k.shape
@@ -52,8 +51,6 @@ def _ring_attention_fwd(
     # TODO: get this number without doing a collective op?
     axis_size = jax.lax.psum(1, axis_name)
     rotate = functools.partial(rotate_block, axis_name=axis_name, axis_size=axis_size)
-
-    sm_scale = 1 / math.sqrt(dk)
 
     def scan_fn(carry, i: Int):
         o, l, m_prev, k, v = carry
@@ -91,7 +88,7 @@ def _ring_attention_fwd(
     return einops.rearrange(o, "b h l d -> b l h d"), res
 
 
-def _ring_attention_bwd(axis_name: str, res, do):
+def _ring_attention_bwd(axis_name: str, sm_scale: float, res, do):
     """Backwards pass for ring attention."""
 
     q, k, v, o, L = res
@@ -104,8 +101,6 @@ def _ring_attention_bwd(axis_name: str, res, do):
     # TODO: get this number without doing a collective op?
     axis_size = jax.lax.psum(1, axis_name)
     rotate = functools.partial(rotate_block, axis_name=axis_name, axis_size=axis_size)
-
-    sm_scale = 1 / math.sqrt(dim_k)
 
     def scan_fn(carry, i: Int):
         q, o, dq, dk, dv, do, L = carry
@@ -141,15 +136,46 @@ def _ring_attention_bwd(axis_name: str, res, do):
     return dq, dk, dv
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(3,))
+@functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4))
+def _ring_attention(
+    q: Float[Array, "b lq h dk"],
+    k: Float[Array, "b lk h dk"],
+    v: Float[Array, "b lk h dv"],
+    axis_name: str,
+    sm_scale: float,
+) -> Float[Array, "b lq h dv"]:
+    o, _ = _ring_attention_fwd(q, k, v, axis_name=axis_name, sm_scale=sm_scale)
+    return o
+
+
+_ring_attention.defvjp(_ring_attention_fwd, _ring_attention_bwd)
+
+
 def ring_attention(
     q: Float[Array, "b lq h dk"],
     k: Float[Array, "b lk h dk"],
     v: Float[Array, "b lk h dv"],
     axis_name: str,
+    sm_scale: float | None = None,
 ) -> Float[Array, "b lq h dv"]:
-    o, _ = _ring_attention_fwd(q, k, v, axis_name)
-    return o
+    """Ring attention.
 
+    Args:
+        q: queries.
+        k: keys
+        v: values
+        axis_name: name of device mesh axis along which sequences are sharded.
+        sm_scale: optional softmax scale, defaults to 1/sqrt(dk) if unspecified.
+    Returns:
+        Attention output (sharded).
+    """
+    if sm_scale is None:
+        sm_scale = 1 / math.sqrt(q.shape[-1])
 
-ring_attention.defvjp(_ring_attention_fwd, _ring_attention_bwd)
+    return _ring_attention(
+        q,
+        k,
+        v,
+        axis_name=axis_name,
+        sm_scale=sm_scale,
+    )
