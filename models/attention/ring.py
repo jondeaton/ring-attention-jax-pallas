@@ -4,7 +4,7 @@ https://github.com/haoliuhl/ringattention/blob/main/ringattention/ringattention_
 """
 
 from __future__ import annotations
-from typing import Any
+from typing import Callable
 
 import jax
 import jax.numpy as jnp
@@ -39,6 +39,9 @@ def _ring_attention_fwd(
     v: Float[Array, "b lk h dv"],
     axis_name: str,
     sm_scale: float,
+    bias_fn: Callable[..., Float[Array, "b lq lk"]] | None = None,
+    bias_fn_q_kwargs: dict[str, PyTree] | None = None,
+    bias_fn_kv_kwargs: dict[str, PyTree] | None = None,
 ) -> tuple[Float[Array, "b lq h dv"], tuple]:
     batch, q_len, num_heads, dk = q.shape
     batch, kv_len, _, _ = k.shape
@@ -53,9 +56,15 @@ def _ring_attention_fwd(
     rotate = functools.partial(rotate_block, axis_name=axis_name, axis_size=axis_size)
 
     def scan_fn(carry, i: Int):
-        o, l, m_prev, k, v = carry
+        o, l, m_prev, k, v, kv_kwargs = carry
 
         s = einops.einsum(q, k, "b h lq dk, b h lk dk -> b h lq lk") * sm_scale
+        if bias_fn is not None:
+            assert bias_fn_q_kwargs is not None
+            assert kv_kwargs is not None
+            bias = bias_fn(**bias_fn_q_kwargs, **kv_kwargs)
+            s += bias
+
         m = jnp.maximum(m_prev, jnp.max(s, axis=-1))
 
         correction = jnp.exp(m_prev - m)
@@ -69,16 +78,16 @@ def _ring_attention_fwd(
         # computed for the backwards pass.
         l = correction * l + jnp.sum(p, axis=-1)
 
-        k, v = rotate([k, v])
-        return (o, l, m, k, v), None
+        (k, v, kv_kwargs) = rotate([k, v, kv_kwargs])
+        return (o, l, m, k, v, kv_kwargs), None
 
     # Loop state initialization.
     o = jnp.zeros(shape=(batch, num_heads, q_len, dv), dtype=v.dtype)
     l = jnp.zeros(shape=(batch, num_heads, q_len), dtype=q.dtype)
     m = jnp.zeros(shape=(batch, num_heads, q_len), dtype=q.dtype) - float("inf")
-    (o, l, m, _, _), _ = jax.lax.scan(
+    (o, l, m, _, _, _), _ = jax.lax.scan(
         scan_fn,
-        init=(o, l, m, k, v),
+        init=(o, l, m, k, v, bias_fn_kv_kwargs),
         xs=jnp.arange(axis_size),
     )
 
@@ -88,10 +97,18 @@ def _ring_attention_fwd(
     return einops.rearrange(o, "b h l d -> b l h d"), res
 
 
-def _ring_attention_bwd(axis_name: str, sm_scale: float, res, do):
+def _ring_attention_bwd(
+    axis_name: str,
+    sm_scale: float,
+    bias_fn: Callable[..., Float[Array, "b lq lk"]] | None,
+    bias_fn_q_kwargs: dict[str, Array] | None,
+    bias_fn_kv_kwargs: dict[str, Array] | None,
+    residuals,
+    do,
+):
     """Backwards pass for ring attention."""
 
-    q, k, v, o, L = res
+    q, k, v, o, L = residuals
     do = einops.rearrange(do, "b l h d -> b h l d")
 
     batch, num_heads, q_len, dim_k = q.shape
@@ -106,6 +123,12 @@ def _ring_attention_bwd(axis_name: str, sm_scale: float, res, do):
         q, o, dq, dk, dv, do, L = carry
 
         s = einops.einsum(q, k, "b h lq dk, b h lk dk -> b h lq lk") * sm_scale
+        if bias_fn is not None:
+            assert bias_fn_q_kwargs is not None
+            assert bias_fn_kv_kwargs is not None
+            bias = bias_fn(**bias_fn_q_kwargs, **bias_fn_kv_kwargs)
+            s += bias
+
         p: Float[Array, "b h lq lk"] = jnp.exp(s - L[..., None])
 
         dv += einops.einsum(p, do, "b h lq lk, b h lq dv -> b h lk dv")
@@ -136,15 +159,27 @@ def _ring_attention_bwd(axis_name: str, sm_scale: float, res, do):
     return dq, dk, dv
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4))
+@functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7))
 def _ring_attention(
     q: Float[Array, "b lq h dk"],
     k: Float[Array, "b lk h dk"],
     v: Float[Array, "b lk h dv"],
     axis_name: str,
     sm_scale: float,
+    bias_fn: Callable[..., Float[Array, "b lq lk"]] | None,
+    bias_fn_q_kwargs: dict[str, Array] | None,
+    bias_fn_kv_kwargs: dict[str, Array] | None,
 ) -> Float[Array, "b lq h dv"]:
-    o, _ = _ring_attention_fwd(q, k, v, axis_name=axis_name, sm_scale=sm_scale)
+    o, _ = _ring_attention_fwd(
+        q,
+        k,
+        v,
+        axis_name=axis_name,
+        sm_scale=sm_scale,
+        bias_fn=bias_fn,
+        bias_fn_q_kwargs=bias_fn_q_kwargs,
+        bias_fn_kv_kwargs=bias_fn_kv_kwargs,
+    )
     return o
 
 
@@ -157,15 +192,23 @@ def ring_attention(
     v: Float[Array, "b lk h dv"],
     axis_name: str,
     sm_scale: float | None = None,
+    bias_fn: Callable[..., Float[Array, "b lq lk"]] | None = None,
+    bias_fn_q_kwargs: dict[str, PyTree] | None = None,
+    bias_fn_kv_kwargs: dict[str, PyTree] | None = None,
 ) -> Float[Array, "b lq h dv"]:
     """Ring attention.
 
     Args:
-        q: queries.
-        k: keys
-        v: values
+        q: single block of queries sharded along the length dimension.
+        k: single block of keys sharded along the length dimension.
+        v: single block of values sharded along the length dimension.
         axis_name: name of device mesh axis along which sequences are sharded.
         sm_scale: optional softmax scale, defaults to 1/sqrt(dk) if unspecified.
+        bias_fn: optional function which computes a block-wise attention bias.
+        bias_fn_q_kwargs: optional set of kwargs to pass to bias_fn which are aligned
+            with the queries.
+        bias_fn_kv_kwargs: optional set of kwargs to pass to bias_fn which are aligned
+            with the keys/values.
     Returns:
         Attention output (sharded).
     """
@@ -178,4 +221,58 @@ def ring_attention(
         v,
         axis_name=axis_name,
         sm_scale=sm_scale,
+        bias_fn=bias_fn,
+        bias_fn_q_kwargs=bias_fn_q_kwargs,
+        bias_fn_kv_kwargs=bias_fn_kv_kwargs,
     )
+
+
+# def ring_attention(
+#     q: Float[Array, "b lq h dk"],
+#     k: Float[Array, "b lk h dk"],
+#     v: Float[Array, "b lk h dv"],
+#     axis_name: str,
+#     sm_scale: float | None = None,
+#     q_segment_ids: Int[Array, "b lq"] | None = None,
+#     kv_segment_ids: Int[Array, "b lq"] | None = None,
+#     causal: bool = False,
+#     q_positions: Int[Array, "b lq"] | None = None,
+#     kv_positions: Int[Array, "b lq"] | None = None,
+# ) -> Float[Array, "b lq h dv"]:
+#     """Ring attention with common parameters."""
+#
+#     def bias_fn(
+#         q_segment_ids: Float[Array, "b lq"] | None,
+#         kv_segment_ids: Float[Array, "b lk"] | None,
+#         q_positions: Int[Array, "b lq"] | None,
+#         k_positions: Int[Array, "b lq"] | None,
+#     ) -> Float[Array, "b lq lk"]:
+#         """Computes attention bias for single block."""
+#
+#
+#         if q_segment_ids is not None:
+#             segment_mask = q_segment_ids[:, :, None] == kv_segment_ids[:, None, :]
+#
+#         if causal:
+#
+#
+#
+#
+#         return jnp.where(mask, 0, -jnp.inf)
+#
+#     return ring_attention_flex(
+#         q,
+#         k,
+#         v,
+#         axis_name=axis_name,
+#         sm_scale=sm_scale,
+#         bias_fn=bias_fn,
+#         bias_fn_q_kwargs={
+#             "q_segment_ids": q_segment_ids,
+#             "query_positions": q_positions,
+#         },
+#         bias_fn_kv_kwargs={
+#             "kv_segment_ids": kv_segment_ids,
+#             "key_positions": kv_positions,
+#         },
+#     )
