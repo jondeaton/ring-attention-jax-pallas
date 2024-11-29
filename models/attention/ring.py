@@ -53,16 +53,24 @@ def _ring_attention_fwd(
     axis_size = jax.lax.psum(1, axis_name)
     rotate = functools.partial(rotate_block, axis_name=axis_name, axis_size=axis_size)
 
+    sm_scale = 1 / math.sqrt(dk)
+
     def scan_fn(carry, i: Int):
         o, l, m_prev, k, v = carry
 
-        s = einops.einsum(q, k, "b h lq dk, b h lk dk -> b h lq lk") / math.sqrt(dk)
+        s = einops.einsum(q, k, "b h lq dk, b h lk dk -> b h lq lk") * sm_scale
         m = jnp.maximum(m_prev, jnp.max(s, axis=-1))
-        p = jnp.exp(s - m[..., None])
-        l = jnp.exp(m_prev - m) * l + jnp.sum(p, axis=-1)
 
+        correction = jnp.exp(m_prev - m)
+
+        p = jnp.exp(s - m[..., None])
         pv = einops.einsum(p, v, "b h lq lk, b h lk dv -> b h lq dv")
-        o = o / jnp.exp(m_prev - m)[..., None] + pv
+
+        o_scale = jnp.where(i == 0, jnp.zeros_like(correction), correction)
+        o = o * o_scale[..., None] + pv
+
+        # computed for the backwards pass.
+        l = correction * l + jnp.sum(p, axis=-1)
 
         k, v = rotate([k, v])
         return (o, l, m, k, v), None
@@ -70,12 +78,13 @@ def _ring_attention_fwd(
     # Loop state initialization.
     o = jnp.zeros(shape=(batch, num_heads, q_len, dv), dtype=v.dtype)
     l = jnp.zeros(shape=(batch, num_heads, q_len), dtype=q.dtype)
-    m = jnp.zeros(shape=(batch, num_heads, q_len), dtype=q.dtype)
+    m = jnp.zeros(shape=(batch, num_heads, q_len), dtype=q.dtype) - float("inf")
     (o, l, m, _, _), _ = jax.lax.scan(
         scan_fn,
         init=(o, l, m, k, v),
         xs=jnp.arange(axis_size),
     )
+
     o = o / l[..., None]
     L: Float[Array, "b h lq"] = m + jnp.log(l)
     res = q, k, v, o, L  # for backwards pass
