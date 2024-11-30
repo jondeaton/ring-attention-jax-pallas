@@ -1,6 +1,18 @@
-"""Ring Attention.
+"""Ring Attention with flexible attention.
 
-https://github.com/haoliuhl/ringattention/blob/main/ringattention/ringattention_jax.py
+This is a JAX adaptation of the ring-attention algorithm introduced in [1] inspired by
+the original JAX implementation in [2]. The original code was adapted significantly
+to more closely resemble the Flash Attention 2 algorithm [3], but where the
+loads/stores to/from SRAM/HBM are replaced with rotations of query/key/value around the
+ring of devices which the sequences are shadred across.
+
+This implementation also supports a general mechamnism for incorporating arbitrary
+attention biases from a user-defined function, similar to Flex Attention [3].
+
+1. ring attention paper
+2. ring attention code https://github.com/haoliuhl/ringattention/blob/main/ringattention/ringattention_jax.py
+3. flash attention 2 paper
+4. flex attention
 """
 
 from __future__ import annotations
@@ -83,7 +95,7 @@ def _ring_attention_fwd(
         # computed and saved for the backwards pass.
         l = correction * l + jnp.sum(p, axis=-1)
 
-        (k, v, kv_kwargs) = rotate([k, v, kv_kwargs])
+        k, v, kv_kwargs = rotate([k, v, kv_kwargs])
         return (o, l, m, k, v, kv_kwargs), None
 
     # Loop state initialization.
@@ -261,7 +273,7 @@ def ring_self_attention(
     segment_ids: Int[Array, "b l"] | None = None,
     positions: Int[Array, "b l"] | None = None,
     prefix_mask: Bool[Array, "b l"] | None = None,
-) -> Float[Array, "b lq h dv"]:
+) -> Float[Array, "b l h dv"]:
     """Ring attention for self-attention.
 
     Supports several variants (and combinations):
@@ -271,21 +283,20 @@ def ring_self_attention(
         - prefixlm attention via prefix_mask (requires positions)
 
     This "full-service" implementation also wraps the general ring attention function
-    wish shard_map so requires `mesh` and `pspec` arguments. It also serves as an
-    exmaple of how to use the
+    wish shard_map so requires `mesh` and `pspec` arguments. Thus it also serves as an
+    exmaple of how to use the general single-shard ring_attention function.
 
     Args:
-        q: sharded query array.
-        k: sharded key array.
-        v: sharded values array.
+        q: full query array sharded along the length axis.
+        k: full key array sharded along the length axis.
+        v: full values array sharded along the length axis.
         mesh: device mesh across which q/k/v are sharded.
         pspec: partition spec describing the sharding of all arrays.
         sm_scale: optional softmax scale, defaults to 1/sqrt(dk) if unspecified.
         causal: whether to use causal self attention
         segment_ids: for block-sparse self-attention eg. for packed-sample attention.
         positions: for causal attention, indicates the position of each token.
-        prefix_mask: for prefixlm attention, indicator array which positions are part of
-            the prefix.
+        prefix_mask: for prefixlm, indicates which positions in the prefix.
     Returns:
         single block of output sharded along the length dimension.
     """
