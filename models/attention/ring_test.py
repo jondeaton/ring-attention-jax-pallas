@@ -14,7 +14,7 @@ from jax.experimental import mesh_utils
 import einops
 from jaxtyping import Float, Int, Array
 
-from models.attention.ring import ring_attention
+from models.attention.ring import ring_attention, ring_self_attention
 
 flags = os.environ.get("XLA_FLAGS", "")
 os.environ["XLA_FLAGS"] = flags + " --xla_force_host_platform_device_count=8"
@@ -35,7 +35,6 @@ def mha(
     qk = einops.einsum(q, k, "b i h d, b j h d -> b h i j")
     z = qk / jnp.sqrt(Dk)
     if bias is not None:
-        assert bias.shape == (B, H, Lq, Lk)
         z += bias
     a = jax.nn.softmax(z, axis=-1)
     return einops.einsum(a, v, "b h i j, b j h d -> b i h d")
@@ -177,7 +176,7 @@ def test_ring_attention_bias(seed: int, q_len: int, kv_len: int, h: int, d: int)
     )
     mesh = Mesh(device_mesh, axis_names=("dp", "sp"))
 
-    batch_size = 1
+    batch_size = 4
 
     keys = jax.random.split(key, 6)
     q = jax.random.normal(keys[0], shape=(batch_size, q_len, h, d))
@@ -279,6 +278,77 @@ def test_ring_attention_bias(seed: int, q_len: int, kv_len: int, h: int, d: int)
     np.testing.assert_allclose(dv, dv_, atol=1e-4)
 
 
-def test_ring_self_attention():
-    # TODO:
-    ...
+def _test_bias_fn(
+    segment_ids: Int[Array, "b l"],
+    causal: bool = False,
+):
+    """compute attention bias for block based on segment ids."""
+    _, length = segment_ids.shape
+
+    mask = segment_ids[:, :, None] == segment_ids[:, None, :]
+
+    if causal:
+        i = jnp.arange(length)
+        causal_mask = i[None, :] <= i[:, None]
+        mask &= causal_mask
+
+    return jnp.where(mask, 0, -jnp.inf)
+
+
+@pytest.mark.parametrize(
+    "seed,length,h,d",
+    [
+        (0, 16, 1, 2),
+        (0, 128, 4, 64),
+        (1, 512, 8, 16),
+        (2, 1024, 8, 128),
+    ],
+)
+def test_ring_self_attention(seed: int, length: int, h: int, d: int):
+    key = jax.random.PRNGKey(seed)
+
+    devices = jax.devices()
+    device_mesh = mesh_utils.create_device_mesh(
+        mesh_shape=(1, 8),
+        devices=devices,
+    )
+    mesh = Mesh(device_mesh, axis_names=("dp", "sp"))
+
+    batch_size = 4
+
+    keys = jax.random.split(key, 4)
+    q = jax.random.normal(keys[0], shape=(batch_size, length, h, d))
+    k = jax.random.normal(keys[1], shape=(batch_size, length, h, d))
+    v = jax.random.normal(keys[2], shape=(batch_size, length, h, d))
+
+    segment_ids = jax.random.randint(
+        keys[3], shape=(batch_size, length), minval=0, maxval=5
+    )
+    positions = einops.repeat(jnp.arange(length), "l -> b l", b=batch_size)
+
+    bias = _test_bias_fn(segment_ids, causal=True)
+    bias = bias[:, None, :, :]
+    expected_output = mha(q, k, v, bias=bias)
+
+    sharding = NamedSharding(mesh, PartitionSpec(None, "sp"))
+    q = jax.device_put(q, sharding)
+    k = jax.device_put(k, sharding)
+    v = jax.device_put(v, sharding)
+    segment_ids = jax.device_put(segment_ids, sharding)
+    positions = jax.device_put(positions, sharding)
+
+    output = jax.jit(
+        ring_self_attention,
+        static_argnames=["mesh", "pspec", "causal"],
+    )(
+        q,
+        k,
+        v,
+        mesh=mesh,
+        pspec=q.sharding.spec,
+        segment_ids=segment_ids,
+        positions=positions,
+        causal=True,
+    )
+
+    np.testing.assert_allclose(output, expected_output, rtol=0.01, atol=0.001)

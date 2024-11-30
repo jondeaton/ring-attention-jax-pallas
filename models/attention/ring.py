@@ -8,6 +8,9 @@ from typing import Callable
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec
+from jax.experimental.shard_map import shard_map
+
 import math
 
 import functools
@@ -248,10 +251,11 @@ def ring_attention(
 
 
 def ring_self_attention(
-    q: Float[Array, "b l h dk"],
-    k: Float[Array, "b l h dk"],
-    v: Float[Array, "b l h dv"],
-    axis_name: str,
+    q: Float[jax.Array, "b l h dk"],
+    k: Float[jax.Array, "b l h dk"],
+    v: Float[jax.Array, "b l h dv"],
+    mesh: jax.sharding.Mesh,
+    pspec: PartitionSpec,
     sm_scale: float | None = None,
     causal: bool = False,
     segment_ids: Int[Array, "b l"] | None = None,
@@ -266,11 +270,16 @@ def ring_self_attention(
         - causal attention (requires positions)
         - prefixlm attention via prefix_mask (requires positions)
 
+    This "full-service" implementation also wraps the general ring attention function
+    wish shard_map so requires `mesh` and `pspec` arguments. It also serves as an
+    exmaple of how to use the
+
     Args:
-        q: single block of queries sharded along the length dimension.
-        k: single block of keys sharded along the length dimension.
-        v: single block of values sharded along the length dimension.
-        axis_name: name of device mesh axis along which sequences are sharded.
+        q: sharded query array.
+        k: sharded key array.
+        v: sharded values array.
+        mesh: device mesh across which q/k/v are sharded.
+        pspec: partition spec describing the sharding of all arrays.
         sm_scale: optional softmax scale, defaults to 1/sqrt(dk) if unspecified.
         causal: whether to use causal self attention
         segment_ids: for block-sparse self-attention eg. for packed-sample attention.
@@ -280,8 +289,6 @@ def ring_self_attention(
     Returns:
         single block of output sharded along the length dimension.
     """
-    batch_size, length, num_heads, _ = q.shape
-
     if causal:
         assert positions is not None, "positions are requried for causal attention"
         assert prefix_mask is None, "causal attention does not support prefix_mask"
@@ -297,14 +304,15 @@ def ring_self_attention(
         kv_positions: Int[Array, "b l"] | None,
         q_prefix_mask: Bool[Array, "b l"] | None,
         kv_prefix_mask: Bool[Array, "b l"] | None,
-    ) -> Float[Array, "b h l l"]:
+    ) -> Float[Array, "b 1 l l"]:
         """block-wise attention bias function."""
 
-        mask = jnp.ones(shape=(batch_size, length), dtype=bool)
+        mask = jnp.array(True)
 
         if q_segment_ids is not None:
             assert kv_segment_ids is not None
-            mask &= q_segment_ids[:, :, None] == kv_segment_ids[:, None, :]
+            segment_mask = q_segment_ids[:, :, None] == kv_segment_ids[:, None, :]
+            mask &= segment_mask
 
         if causal:
             assert q_positions is not None
@@ -322,7 +330,7 @@ def ring_self_attention(
             mask &= prefix_mask | causal_mask
 
         bias = jnp.where(mask, 0, -jnp.inf)
-        return einops.repeat(bias, "b l l -> b h l l", h=num_heads)
+        return bias[:, None, :, :]  # add singleton heads dimension
 
     bias_q_kwargs = {
         "q_segment_ids": segment_ids,
@@ -335,13 +343,30 @@ def ring_self_attention(
         "kv_prefix_mask": prefix_mask,
     }
 
-    return ring_attention(
-        q,
-        k,
-        v,
-        axis_name=axis_name,
-        sm_scale=sm_scale,
-        bias_fn=bias_fn,
-        bias_q_kwargs=bias_q_kwargs,
-        bias_kv_kwargs=bias_kv_kwargs,
-    )
+    def _ring_attn_fn(q, k, v, bias_q_kwargs, bias_kv_kwargs):
+        """binds static args to ring_attention."""
+        # TODO: why can we not just bind the static args with functools.partial?
+        return ring_attention(
+            q,
+            k,
+            v,
+            axis_name=pspec[1],
+            sm_scale=sm_scale,
+            bias_fn=bias_fn,
+            bias_q_kwargs=bias_q_kwargs,
+            bias_kv_kwargs=bias_kv_kwargs,
+        )
+
+    return shard_map(
+        _ring_attn_fn,
+        mesh=mesh,
+        in_specs=(
+            pspec,  # q
+            pspec,  # k
+            pspec,  # v
+            pspec,  # bias_q_kwargs
+            pspec,  # bias_kv_kwargs
+        ),
+        out_specs=pspec,  # type: ignore
+        check_rep=False,
+    )(q, k, v, bias_q_kwargs, bias_kv_kwargs)
