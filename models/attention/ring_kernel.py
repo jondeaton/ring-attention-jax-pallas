@@ -33,7 +33,7 @@ def mha_forward_kernel(
     q_ref,
     k_ref,
     v_ref,  # Input arrays
-    # bias_ref,
+    bias_ref,
     segment_ids_ref: jax.Array | None,  # segment_id arrays
     o_ref: Any,  # Output
     *residual_refs: Any,  # Residual outputs
@@ -96,9 +96,6 @@ def mha_forward_kernel(
             # Apply mask to qk.
             qk = jnp.where(mask, qk, DEFAULT_MASK_VALUE)
 
-        # if bias_ref is not None:
-        #     bias = pl.load
-
         m_curr = qk.max(axis=-1)
         m_next = jnp.maximum(m_prev, m_curr)
         correction = jnp.exp(m_prev - m_next)
@@ -134,7 +131,10 @@ def mha_forward_kernel(
     o_ref[...] = o.astype(o_ref.dtype)
 
 
-def segment_mask(q_segment_ids: jax.Array, kv_segment_ids: jax.Array):
+def segment_mask(
+    q_segment_ids: jax.Array,
+    kv_segment_ids: jax.Array,
+):
     # [B, T, 1] or [T, 1]
     q_segment_ids = jnp.expand_dims(q_segment_ids, axis=-1)
     # [B, 1, S] or [1, S]
@@ -145,7 +145,10 @@ def segment_mask(q_segment_ids: jax.Array, kv_segment_ids: jax.Array):
     return jnp.equal(q_segment_ids, kv_segment_ids).astype(jnp.bool_)
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=[4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
+@functools.partial(
+    jax.custom_vjp,
+    nondiff_argnums=[5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+)
 @functools.partial(
     jax.jit,
     static_argnames=[
@@ -165,7 +168,7 @@ def mha(
     q,
     k,
     v,
-    # bias,
+    bias,
     segment_ids: jnp.ndarray | None,
     sm_scale: float = 1.0,
     causal: bool = False,
@@ -205,7 +208,7 @@ def mha(
         pl.BlockSpec((None, block_q, None, head_dim), lambda i, j, k: (j, i, k, 0)),
         pl.BlockSpec((None, kv_seq_len, None, head_dim), lambda _, j, k: (j, 0, k, 0)),
         pl.BlockSpec((None, kv_seq_len, None, head_dim), lambda _, j, k: (j, 0, k, 0)),
-        # pl.BlockSpec((None, None, block_q, kv_seq_len), lambda i, j, k: (j, k, i)),
+        pl.BlockSpec((None, None, block_q, kv_seq_len), lambda i, j, k: (j, k, i, 0)),
     ]
     in_specs.append(
         None  # type: ignore[arg-type]
@@ -227,13 +230,14 @@ def mha(
         debug=debug,
         interpret=interpret,
         name="mha_forward",
-    )(q, k, v, segment_ids)
+    )(q, k, v, bias, segment_ids)
 
 
 def _mha_forward(
     q,
     k,
     v,
+    bias,
     segment_ids: jax.Array | None,
     sm_scale: float,
     causal: bool,
@@ -279,6 +283,7 @@ def _mha_forward(
         pl.BlockSpec((None, block_q, None, head_dim), lambda i, j, k: (j, i, k, 0)),
         pl.BlockSpec((None, kv_seq_len, None, head_dim), lambda _, j, k: (j, 0, k, 0)),
         pl.BlockSpec((None, kv_seq_len, None, head_dim), lambda _, j, k: (j, 0, k, 0)),
+        pl.BlockSpec((None, None, block_q, kv_seq_len), lambda i, j, k: (j, k, i, 0)),
     ]
     in_specs.append(
         None  # type: ignore[arg-type]
@@ -298,8 +303,8 @@ def _mha_forward(
         debug=debug,
         interpret=interpret,
         name="mha_forward",
-    )(q, k, v, segment_ids)
-    return out, (q, k, v, segment_ids, out, lse)
+    )(q, k, v, bias, segment_ids)
+    return out, (q, k, v, bias, segment_ids, out, lse)
 
 
 def _preprocess_backward_kernel(out_ref, dout_ref, delta_ref):
@@ -502,7 +507,7 @@ def _mha_backward(
     do,
 ):
     del num_warps, num_stages, grid
-    q, k, v, segment_ids, out, lse = res
+    q, k, v, bias, segment_ids, out, lse = res
 
     if backward_pass_impl == "xla":
         return jax.vjp(
@@ -531,6 +536,9 @@ def _mha_backward(
             pl.BlockSpec(
                 (None, kv_seq_len, None, head_dim), lambda i, j, _: (i, 0, j, 0)
             ),
+            # pl.BlockSpec(
+            #     (None, None, q_seq_len, kv_seq_len), lambda i, j, k: (i, j, 0, k)
+            # ),
             pl.BlockSpec(
                 (None, kv_seq_len, None, head_dim), lambda i, j, _: (i, 0, j, 0)
             ),
@@ -585,32 +593,7 @@ def _mha_backward(
         )(q, k, v, segment_ids, out, do, lse, delta)
     else:
         raise ValueError(f"Invalid backward pass implementation: {backward_pass_impl}")
-    return dq.astype(q.dtype), dk, dv, None
+    return dq.astype(q.dtype), dk, dv, None, None
 
 
 mha.defvjp(_mha_forward, _mha_backward)
-
-
-@functools.partial(jax.jit, static_argnames=["sm_scale", "causal"])
-def mha_reference(
-    q,
-    k,
-    v,
-    segment_ids: jnp.ndarray | None,
-    sm_scale=1.0,
-    causal: bool = False,
-):
-    q_seq_len = q.shape[1]
-    kv_seq_len = k.shape[1]
-    logits = jnp.einsum("bqhc,bkhc->bhqk", q, k).astype(jnp.float32)
-    mask = None
-    if segment_ids is not None:
-        mask = jnp.expand_dims(segment_mask(segment_ids, segment_ids), 1)
-        mask = jnp.broadcast_to(mask, logits.shape)
-    if causal:
-        causal_mask = jnp.tril(jnp.ones((1, 1, q_seq_len, kv_seq_len), dtype=bool))
-        causal_mask = jnp.broadcast_to(causal_mask, logits.shape)
-        mask = causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
-    logits = logits if mask is None else jnp.where(mask, logits, float("-inf"))
-    weights = jax.nn.softmax(logits * sm_scale).astype(q.dtype)
-    return jnp.einsum("bhqk,bkhc->bqhc", weights, v)
