@@ -16,8 +16,8 @@ import einops
 from jaxtyping import Float, Int, Bool, Array, PyTree
 
 
-def rotate_block(x: PyTree, axis_name: str, axis_size: int) -> PyTree:
-    """Rotates an array block (ie key/query block) along the axis.
+def _rotate_block(x: PyTree, axis_name: str, axis_size: int) -> PyTree:
+    """Rotates an array block (ie query/key block) along the sharding axis.
 
     Args:
         x: array block to rotate
@@ -53,7 +53,7 @@ def _ring_attention_fwd(
 
     # TODO: get this number without doing a collective op?
     axis_size = jax.lax.psum(1, axis_name)
-    rotate = functools.partial(rotate_block, axis_name=axis_name, axis_size=axis_size)
+    rotate = functools.partial(_rotate_block, axis_name=axis_name, axis_size=axis_size)
 
     def scan_fn(carry, i: Int):
         o, l, m_prev, k, v, kv_kwargs = carry
@@ -88,8 +88,7 @@ def _ring_attention_fwd(
     l = jnp.zeros(shape=(batch, num_heads, q_len), dtype=q.dtype)
     m = jnp.zeros(shape=(batch, num_heads, q_len), dtype=q.dtype) - float("inf")
 
-    # TODO: use the final rotation of keys/values to reduce memory.
-    (o, l, m, _, _, _), _ = jax.lax.scan(
+    (o, l, m, k, v, _), _ = jax.lax.scan(
         scan_fn,
         init=(o, l, m, k, v, bias_kv_kwargs),
         xs=jnp.arange(axis_size),
@@ -119,7 +118,7 @@ def _ring_attention_bwd(
 
     # TODO: get this number without doing a collective op?
     axis_size = jax.lax.psum(1, axis_name)
-    rotate = functools.partial(rotate_block, axis_name=axis_name, axis_size=axis_size)
+    rotate = functools.partial(_rotate_block, axis_name=axis_name, axis_size=axis_size)
 
     def scan_fn(carry, i: Int):
         q, o, dq, dk, dv, do, L, bias_q_kwargs = carry
@@ -260,6 +259,12 @@ def ring_self_attention(
     prefix_mask: Bool[Array, "b l"] | None = None,
 ) -> Float[Array, "b lq h dv"]:
     """Ring attention for self-attention.
+
+    Supports several variants (and combinations):
+        - full bidirectional attention (default)
+        - block-sparse attention via segment_ids
+        - causal attention (requires positions)
+        - prefixlm attention via prefix_mask (requires positions)
 
     Args:
         q: single block of queries sharded along the length dimension.
