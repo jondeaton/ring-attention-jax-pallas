@@ -13,7 +13,7 @@ import math
 import functools
 import einops
 
-from jaxtyping import Float, Int, Array, PRNGKeyArray, PyTree
+from jaxtyping import Float, Int, Bool, Array, PyTree
 
 
 def rotate_block(x: PyTree, axis_name: str, axis_size: int) -> PyTree:
@@ -77,7 +77,7 @@ def _ring_attention_fwd(
         o_scale = jnp.where(i == 0, jnp.zeros_like(correction), correction)
         o = o * o_scale[..., None] + pv
 
-        # computed for the backwards pass.
+        # computed and saved for the backwards pass.
         l = correction * l + jnp.sum(p, axis=-1)
 
         (k, v, kv_kwargs) = rotate([k, v, kv_kwargs])
@@ -199,7 +199,19 @@ def ring_attention(
     bias_kv_kwargs: dict[str, PyTree] | None = None,
     sm_scale: float | None = None,
 ) -> Float[Array, "b lq h dv"]:
-    """Ring attention.
+    """Ring attention - general.
+
+    This generalized ring-attention function enables integration of arbitrary attention
+    bias computed block-wise. It presents a similar as PyTorch's Flex Attention
+    (https://pytorch.org/blog/flexattention/):
+
+    The user-defined bias_fn computes a single block of attention-bias given sharded
+    arrays in bias_(q|kv)_kwargs, for example segment-ids for block-sparse attention.
+    The sharded arrays in bias_fn kwargs rotate along the device ring in sync
+    with queries or keys, must be given to bias_q_kwargs/bias_kv_kwargs, respectively.
+
+    See the implementaiton of ring_self_attention as an example of block-sparse causal
+    or prefixlm attention.
 
     Args:
         q: single block of queries sharded along the length dimension.
@@ -225,6 +237,100 @@ def ring_attention(
         bias_kv_kwargs = {}
 
     return _ring_attention(
+        q,
+        k,
+        v,
+        axis_name=axis_name,
+        sm_scale=sm_scale,
+        bias_fn=bias_fn,
+        bias_q_kwargs=bias_q_kwargs,
+        bias_kv_kwargs=bias_kv_kwargs,
+    )
+
+
+def ring_self_attention(
+    q: Float[Array, "b l h dk"],
+    k: Float[Array, "b l h dk"],
+    v: Float[Array, "b l h dv"],
+    axis_name: str,
+    sm_scale: float | None = None,
+    causal: bool = False,
+    segment_ids: Int[Array, "b l"] | None = None,
+    positions: Int[Array, "b l"] | None = None,
+    prefix_mask: Bool[Array, "b l"] | None = None,
+) -> Float[Array, "b lq h dv"]:
+    """Ring attention for self-attention.
+
+    Args:
+        q: single block of queries sharded along the length dimension.
+        k: single block of keys sharded along the length dimension.
+        v: single block of values sharded along the length dimension.
+        axis_name: name of device mesh axis along which sequences are sharded.
+        sm_scale: optional softmax scale, defaults to 1/sqrt(dk) if unspecified.
+        causal: whether to use causal self attention
+        segment_ids: for block-sparse self-attention eg. for packed-sample attention.
+        positions: for causal attention, indicates the position of each token.
+        prefix_mask: for prefixlm attention, indicator array which positions are part of
+            the prefix.
+    Returns:
+        single block of output sharded along the length dimension.
+    """
+    batch_size, length, num_heads, _ = q.shape
+
+    if causal:
+        assert positions is not None, "positions are requried for causal attention"
+        assert prefix_mask is None, "causal attention does not support prefix_mask"
+
+    if prefix_mask is not None:
+        assert positions is not None, "positions are requried for prefixlm attention"
+        assert not causal
+
+    def bias_fn(
+        q_segment_ids: Int[Array, "b l"] | None,
+        kv_segment_ids: Int[Array, "b l"] | None,
+        q_positions: Int[Array, "b l"] | None,
+        kv_positions: Int[Array, "b l"] | None,
+        q_prefix_mask: Bool[Array, "b l"] | None,
+        kv_prefix_mask: Bool[Array, "b l"] | None,
+    ) -> Float[Array, "b h l l"]:
+        """block-wise attention bias function."""
+
+        mask = jnp.ones(shape=(batch_size, length), dtype=bool)
+
+        if q_segment_ids is not None:
+            assert kv_segment_ids is not None
+            mask &= q_segment_ids[:, :, None] == kv_segment_ids[:, None, :]
+
+        if causal:
+            assert q_positions is not None
+            assert kv_positions is not None
+            causal_mask = kv_positions[:, None, :] <= q_positions[:, :, None]
+            mask &= causal_mask
+
+        elif q_prefix_mask is not None:
+            assert kv_prefix_mask is not None
+            assert q_positions is not None
+            assert kv_positions is not None
+
+            prefix_mask = q_prefix_mask[:, :, None] & kv_prefix_mask[:, None, :]
+            causal_mask = kv_positions[:, None, :] <= q_positions[:, :, None]
+            mask &= prefix_mask | causal_mask
+
+        bias = jnp.where(mask, 0, -jnp.inf)
+        return einops.repeat(bias, "b l l -> b h l l", h=num_heads)
+
+    bias_q_kwargs = {
+        "q_segment_ids": segment_ids,
+        "q_positions": positions,
+        "q_prefix_mask": prefix_mask,
+    }
+    bias_kv_kwargs = {
+        "kv_segment_ids": segment_ids,
+        "kv_positions": positions,
+        "kv_prefix_mask": prefix_mask,
+    }
+
+    return ring_attention(
         q,
         k,
         v,

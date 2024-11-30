@@ -12,11 +12,9 @@ from jax.experimental.shard_map import shard_map
 from jax.experimental import mesh_utils
 
 import einops
-from jaxtyping import Float, Int, Array, PRNGKeyArray
+from jaxtyping import Float, Int, Array
 
 from models.attention.ring import ring_attention
-
-# from models.attention.ringattention_jax import ring_attention
 
 flags = os.environ.get("XLA_FLAGS", "")
 os.environ["XLA_FLAGS"] = flags + " --xla_force_host_platform_device_count=8"
@@ -186,18 +184,11 @@ def test_ring_attention_bias(seed: int, q_len: int, kv_len: int, h: int, d: int)
     k = jax.random.normal(keys[1], shape=(batch_size, kv_len, h, d))
     v = jax.random.normal(keys[2], shape=(batch_size, kv_len, h, d))
 
-    # q_segment_ids = jax.random.randint(
-    #     keys[4], shape=(batch_size, q_len), minval=0, maxval=q_len // 5
-    # )
-    # kv_segment_ids = jax.random.randint(
-    #     keys[5], shape=(batch_size, kv_len), minval=0, maxval=q_len // 5
-    # )
-
-    q_segment_ids = einops.repeat(
-        jnp.arange(q_len) // (q_len // 5), "l -> b l", b=batch_size
+    q_segment_ids = jax.random.randint(
+        keys[3], shape=(batch_size, q_len), minval=0, maxval=q_len // 5
     )
-    kv_segment_ids = einops.repeat(
-        jnp.arange(kv_len) // (kv_len // 3), "l -> b l", b=batch_size
+    kv_segment_ids = jax.random.randint(
+        keys[4], shape=(batch_size, kv_len), minval=0, maxval=q_len // 5
     )
 
     attn_mask = q_segment_ids[:, :, None] == kv_segment_ids[:, None, :]
@@ -223,6 +214,7 @@ def test_ring_attention_bias(seed: int, q_len: int, kv_len: int, h: int, d: int)
         return einops.repeat(bias, "b lq lk -> b h lq lk", h=h)
 
     def attn(q, k, v, q_kwargs, kv_kwargs):
+        # TODO: why can't I just bind axis_name using functools.partial
         return ring_attention(
             q,
             k,
@@ -285,3 +277,8 @@ def test_ring_attention_bias(seed: int, q_len: int, kv_len: int, h: int, d: int)
     np.testing.assert_allclose(dq, dq_, atol=1e-4)
     np.testing.assert_allclose(dk, dk_, atol=1e-4)
     np.testing.assert_allclose(dv, dv_, atol=1e-4)
+
+
+def test_ring_self_attention():
+    # TODO:
+    ...
