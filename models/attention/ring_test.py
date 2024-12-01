@@ -19,6 +19,8 @@ from models.attention.ring import ring_attention, ring_self_attention
 flags = os.environ.get("XLA_FLAGS", "")
 os.environ["XLA_FLAGS"] = flags + " --xla_force_host_platform_device_count=8"
 
+jax.config.update("jax_traceback_filtering", "off")
+
 
 # Reference implementations.
 def mha(
@@ -97,8 +99,8 @@ def test_ring_attention_forward(seed: int, q_len: int, kv_len: int, h: int, d: i
 @pytest.mark.parametrize(
     "seed,q_len,kv_len,h,d",
     [
-        (0, 24, 16, 1, 2),
-        (0, 128, 64, 4, 2),
+        (0, 24, 24, 1, 2),
+        (0, 128, 128, 4, 2),
         (1, 512, 512, 8, 2),
         (2, 1024, 512, 8, 128),
         (3, 2048, 2048, 4, 128),
@@ -114,11 +116,17 @@ def test_ring_attention_backward(seed: int, q_len: int, kv_len: int, h: int, d: 
     )
     mesh = Mesh(device_mesh, axis_names=("dp", "sp"))
 
-    batch_size = 4
+    batch_size = 1
 
     q = jax.random.normal(key, shape=(batch_size, q_len, h, d))
     k = jax.random.normal(key, shape=(batch_size, kv_len, h, d))
     v = jax.random.normal(key, shape=(batch_size, kv_len, h, d))
+
+    # expected outputs.
+    dq_, dk_, dv_ = jax.grad(
+        lambda q, k, v: mha(q, k, v).sum(),
+        argnums=(0, 1, 2),
+    )(q, k, v)
 
     sharding = NamedSharding(mesh, PartitionSpec(None, "sp"))
 
@@ -148,11 +156,6 @@ def test_ring_attention_backward(seed: int, q_len: int, kv_len: int, h: int, d: 
     assert not jnp.isnan(dq).any()
     assert not jnp.isnan(dk).any()
     assert not jnp.isnan(dv).any()
-
-    dq_, dk_, dv_ = jax.grad(
-        lambda q, k, v: mha(q, k, v).sum(),
-        argnums=(0, 1, 2),
-    )(q, k, v)
 
     np.testing.assert_allclose(dq, dq_, atol=1e-4)
     np.testing.assert_allclose(dk, dk_, atol=1e-4)

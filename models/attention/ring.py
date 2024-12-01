@@ -131,6 +131,7 @@ def _ring_attention_fwd(
 
 
 def _bwd_block(q, k, v, bias, o, L, do, sm_scale):
+    """Computes vjp for single block."""
     s = einops.einsum(q, k, "b h lq dk, b h lk dk -> b h lq lk") * sm_scale
     if bias is not None:
         s += bias
@@ -243,7 +244,7 @@ def ring_attention(
     bias_q_kwargs: dict[str, PyTree] | None = None,
     bias_kv_kwargs: dict[str, PyTree] | None = None,
     sm_scale: float | None = None,
-    block_impl: str = "jax",  # "jax", "pallas"
+    block_impl: str = "pallas",  # "jax", "pallas"
 ) -> Float[Array, "b lq h dv"]:
     """Ring attention - general.
 
@@ -289,7 +290,8 @@ def ring_attention(
         from models.attention.ring_kernel import fwd_block, bwd_block
 
         q_len = q.shape[1]
-        k_len = q.shape[1]
+        k_len = k.shape[1]
+        # TODO: assign these within the kernel wrapper.
         fwd_block_fn = functools.partial(
             fwd_block, block_q=min(q_len, 128), block_k=min(k_len, 128)
         )

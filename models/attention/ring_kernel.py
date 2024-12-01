@@ -176,9 +176,328 @@ def fwd_block(
     )(q, k, v, bias, o, m, l)
 
 
-def _mha_backward_kernel():
-    # TODO:...
-    ...
+def bwd_block(
+    q: Float[Array, "b h lq dk"],
+    k: Float[Array, "b h lk dk"],
+    v: Float[Array, "b h lk dv"],
+    bias: Float[Array, "b h lq lk"] | None,
+    o: Float[Array, "b h lq dv"],
+    L: Float[Array, "b h lq"],
+    do: Float[Array, "b h lq dv"],
+    sm_scale: float,
+    block_q: int = 128,
+    block_k: int = 128,
+    debug: bool = False,
+    interpret: bool = True,
+):
+    """Computes vjp for single block."""
+    batch_size, num_heads, q_len, dim_k = q.shape
+    _, _, k_len, dim_v = v.shape
+
+    assert q_len % block_q == 0, (q_len, block_q)
+    assert k_len % block_k == 0, (k_len, block_k)
+
+    delta = _preprocess_backward(o, do, L, block_q, debug, interpret)
+
+    dq, dk, dv = pl.pallas_call(
+        functools.partial(
+            _bwd_kernel,
+            sm_scale=sm_scale,
+            block_q1=block_q,
+            block_k1=block_k,
+            block_q2=block_q,
+            block_k2=block_k,
+            block_d=dim_k,
+        ),
+        grid=(batch_size, num_heads, pl.cdiv(k_len, block_k)),
+        in_specs=[
+            pl.BlockSpec(  # q
+                (None, None, q_len, dim_k), lambda b, h, lk: (b, h, 0, 0)
+            ),
+            pl.BlockSpec(  # k
+                (None, None, k_len, dim_k), lambda b, h, lk: (b, h, 0, 0)
+            ),
+            pl.BlockSpec(  # v
+                (None, None, k_len, dim_k), lambda b, h, lk: (b, h, 0, 0)
+            ),
+            (  # bias
+                pl.BlockSpec((None, None, q_len, k_len), lambda b, h, lk: (b, h, 0, lk))
+                if bias is not None
+                else None
+            ),
+            pl.BlockSpec((None, None, q_len, dim_k), lambda b, h, _: (b, h, 0, 0)),  # o
+            pl.BlockSpec((None, None, q_len), lambda b, h, _: (b, h, 0)),  # lse
+            pl.BlockSpec(  # do
+                (None, None, q_len, dim_k), lambda b, h, _: (b, h, 0, 0)
+            ),
+            pl.BlockSpec((None, None, q_len), lambda i, j, _: (i, j, 0)),  # delta
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct(q.shape, q.dtype),
+            jax.ShapeDtypeStruct(k.shape, k.dtype),
+            jax.ShapeDtypeStruct(v.shape, v.dtype),
+        ],
+        out_specs=[
+            pl.BlockSpec(
+                (None, None, block_q, dim_k),
+                lambda i, j, k: (i, j, k, 0),  # dq
+            ),
+            pl.BlockSpec(
+                (None, None, block_k, dim_k),
+                lambda i, j, k: (i, j, k, 0),  # dk
+            ),
+            pl.BlockSpec(
+                (None, None, block_k, dim_k),
+                lambda i, j, k: (i, j, k, 0),  # dv
+            ),
+        ],
+        name="mha_backward",
+        debug=debug,
+        interpret=interpret,
+        compiler_params=dict(triton=dict(num_warps=8, num_stages=2)),
+    )(q, k, v, bias, o, L, do, delta)
+
+    return dq.astype(q.dtype), dk, dv
 
 
-def bwd_block(): ...
+def __bwd_kernel(
+    # Inputs
+    q_ref,
+    k_ref,
+    v_ref,
+    bias_ref,
+    out_ref,
+    lse_ref,
+    do_scaled_ref,
+    delta_ref,
+    # Outputs
+    dq_ref,
+    dk_ref,
+    dv_ref,
+    *,
+    sm_scale: float,
+    block_q1: int,
+    block_k1: int,
+    # block_q2: int,
+    # block_k2: int,
+    block_d: int,
+):
+    q_len = q_ref.shape[0]
+    k_len = k_ref.shape[0]
+
+    # Scan #1: dK and dV
+    #   1. Load a block of K and V of size (block_k1, head_dim) in SMEM.
+    #   2. Iterate through Q in chunks of (block_q1, head_dim) to accumulate
+    #      dK and dV.
+    start_k = pl.program_id(2)
+    curr_k_slice = pl.dslice(start_k * block_k1, block_k1)
+
+    dq = jnp.zeros([block_q1, block_d], dtype=jnp.float32)
+    dv = jnp.zeros([block_k1, block_d], dtype=jnp.float32)
+    dk = jnp.zeros([block_k1, block_d], dtype=jnp.float32)
+
+    k = pl.load(k_ref, (curr_k_slice, slice(None)))
+    v = pl.load(v_ref, (curr_k_slice, slice(None)))
+
+    def scan_fn(start_q, carry):
+        dq, dk, dv = carry
+        curr_q_slice = pl.dslice(start_q * block_q1, block_q1)
+
+        q = pl.load(q_ref, (curr_q_slice, slice(None)))
+        qk = pl.dot(q, k.T)
+        if sm_scale != 1.0:
+            qk *= sm_scale
+
+        if bias_ref is not None:
+            # TODO: why do I have to index with curr_k_slice here but I don't have to
+            # index with curr_q_slice in forward??
+            bias = pl.load(bias_ref, (curr_q_slice, curr_k_slice))
+            qk += bias
+
+        lse = pl.load(lse_ref, (curr_q_slice,))
+        di = pl.load(delta_ref, (curr_q_slice,))
+        do = pl.load(do_scaled_ref, (curr_q_slice, slice(None)))
+
+        p = jnp.exp(qk - lse[:, None])
+        dv = dv + pl.dot(p.astype(do.dtype).T, do)
+
+        # if computing delta on the fly
+        # o = pl.load(out_ref, (curr_q_slice, slice(None)))
+        # di = jnp.sum(do * o, axis=1)
+        # pl.debug_print("di", di)
+
+        dp = jnp.zeros((block_q1, block_k1), dtype=jnp.float32) - di[:, None]
+        dp = dp + pl.dot(do, v.T)
+        ds = p * dp
+        if sm_scale != 1.0:
+            ds = ds * sm_scale
+
+        dq = dq + pl.dot(ds.astype(k_ref.dtype), k)
+        dk = dk + pl.dot(ds.astype(q_ref.dtype).T, q)
+
+        return dq, dk, dv
+
+    dq, dk, dv = jax.lax.fori_loop(0, pl.cdiv(q_len, block_q1), scan_fn, (dq, dk, dv))
+
+    dq_ref[...] = dq.astype(dq_ref.dtype)
+    dk_ref[...] = dk.astype(dk_ref.dtype)
+    dv_ref[...] = dv.astype(dv_ref.dtype)
+
+
+# This kernel computes dK_i, dV_i and dQ_i in parallel across the sequence
+# length.
+# Inspired by the triton tutorial: https://github.com/triton-lang/triton/blob/main/python/tutorials/06-fused-attention.py
+def _bwd_kernel(
+    # Inputs
+    q_ref,
+    k_ref,
+    v_ref,
+    bias_ref,
+    out_ref,
+    lse_ref,
+    do_scaled_ref,
+    delta_ref,
+    # Outputs
+    dq_ref,
+    dk_ref,
+    dv_ref,
+    *,
+    sm_scale: float,
+    block_q1: int,
+    block_k1: int,
+    block_q2: int,
+    block_k2: int,
+    block_d: int,
+):
+    del out_ref  # Not needed
+    q_len = q_ref.shape[0]
+    k_len = k_ref.shape[0]
+
+    # Scan #1: dK and dV
+    #   1. Load a block of K and V of size (block_k1, head_dim) in SMEM.
+    #   2. Iterate through Q in chunks of (block_q1, head_dim) to accumulate
+    #      dK and dV.
+    start_k = pl.program_id(2)
+    curr_k_slice = pl.dslice(start_k * block_k1, block_k1)
+
+    dv = jnp.zeros([block_k1, block_d], dtype=jnp.float32)
+    dk = jnp.zeros([block_k1, block_d], dtype=jnp.float32)
+
+    v = pl.load(v_ref, (curr_k_slice, slice(None)))
+    k = pl.load(k_ref, (curr_k_slice, slice(None)))
+    span_k = start_k * block_k1 + jnp.arange(block_k1)
+
+    def inner_loop_dkdv(start_q, carry):
+        dv, dk = carry
+        curr_q_slice = pl.dslice(start_q * block_q1, block_q1)
+
+        q = pl.load(q_ref, (curr_q_slice, slice(None)))
+        qk = pl.dot(q, k.T)
+        if sm_scale != 1.0:
+            qk *= sm_scale
+
+        if bias_ref is not None:
+            # TODO: why do I have to index with curr_k_slice here but I don't have to
+            # index with curr_q_slice in forward??
+            bias = pl.load(bias_ref, (curr_q_slice, curr_k_slice))
+            qk += bias
+
+        lse = pl.load(lse_ref, (curr_q_slice,))
+        di = pl.load(delta_ref, (curr_q_slice,))
+        do = pl.load(do_scaled_ref, (curr_q_slice, slice(None)))
+
+        p = jnp.exp(qk - lse[:, None])
+        dv = dv + pl.dot(p.astype(do.dtype).T, do)
+        dp = jnp.zeros((block_q1, block_k1), dtype=jnp.float32) - di[:, None]
+        dp = dp + pl.dot(do, v.T)
+        ds = p * dp
+        if sm_scale != 1.0:
+            ds = ds * sm_scale
+        dk = dk + pl.dot(ds.astype(q_ref.dtype).T, q)
+
+        return dv, dk
+
+    dv, dk = jax.lax.fori_loop(0, pl.cdiv(q_len, block_q1), inner_loop_dkdv, (dv, dk))
+    dv_ref[...] = dv.astype(dv_ref.dtype)
+    dk_ref[...] = dk.astype(dk_ref.dtype)
+
+    # pl.debug_print("dk", dk)
+    # pl.debug_print("dv", dv)
+    del dv, dk
+
+    # Scan #2: dQ
+    #   1. Load a block of Q of size (block_q2, head_dim) in SMEM.
+    #   2. Iterate through K and V in chunks of (block_k2, head_dim) to
+    #     accumulate dQ.
+    start_q = pl.program_id(2)
+    curr_q_slice = pl.ds(start_q * block_q2, block_q2)
+    span_q = start_q * block_q2 + jnp.arange(block_q2)
+    dq = jnp.zeros([block_q2, block_d], dtype=jnp.float32)
+
+    q = pl.load(q_ref, (curr_q_slice, slice(None)))
+    lse = pl.load(lse_ref, (curr_q_slice,))
+    do = pl.load(do_scaled_ref, (curr_q_slice, slice(None)))
+    di = pl.load(delta_ref, (curr_q_slice,))
+
+    def inner_loop_dq(start_k, dq):
+        curr_k_slice = pl.dslice(start_k * block_k2, block_k2)
+        k = pl.load(k_ref, (curr_k_slice, slice(None)))
+        v = pl.load(v_ref, (curr_k_slice, slice(None)))
+
+        qk = pl.dot(q, k.T)
+        if sm_scale != 1.0:
+            qk *= sm_scale
+
+        if bias_ref is not None:
+            # TODO: why do I have to index with curr_k_slice here but I don't have to
+            # index with curr_q_slice in forward??
+            bias = pl.load(bias_ref, (curr_q_slice, curr_k_slice))
+            qk += bias
+
+        p = jnp.exp(qk - lse[:, None])
+        dp = jnp.zeros((block_q2, block_k2), dtype=jnp.float32) - di[:, None]
+        dp = dp + pl.dot(do, v.T)
+        ds = p * dp
+        if sm_scale != 1.0:
+            ds = ds * sm_scale
+
+        dq = dq + pl.dot(ds.astype(k.dtype), k).astype(dq.dtype)
+
+        return dq
+
+    upper_bound = pl.cdiv(k_len, block_k2)
+
+    dq = jax.lax.fori_loop(0, upper_bound, inner_loop_dq, (dq))
+    dq_ref[...] = dq.astype(dq_ref.dtype)
+
+
+def _preprocess_backward_kernel(out_ref, dout_ref, delta_ref):
+    # load
+    o = out_ref[...].astype(jnp.float32)
+    do = dout_ref[...].astype(jnp.float32)
+    # compute
+    delta = jnp.sum(o * do, axis=1)
+    # write-back
+    delta_ref[...] = delta.astype(delta_ref.dtype)
+
+
+@jax.named_scope("preprocess_backward")
+def _preprocess_backward(out, do, lse, block_q: int, debug: bool, interpret: bool):
+    batch_size, num_heads, seq_len, head_dim = out.shape
+
+    delta = pl.pallas_call(
+        _preprocess_backward_kernel,
+        # grid=(pl.cdiv(seq_len, block_q), batch_size, num_heads),
+        grid=(batch_size, num_heads, pl.cdiv(seq_len, block_q)),
+        in_specs=[
+            pl.BlockSpec((None, None, block_q, head_dim), lambda b, h, l: (b, h, l, 0)),
+            pl.BlockSpec((None, None, block_q, head_dim), lambda b, h, l: (b, h, l, 0)),
+        ],
+        out_specs=pl.BlockSpec((None, None, block_q), lambda b, h, l: (b, h, l)),
+        compiler_params=dict(triton=dict(num_warps=4, num_stages=3)),
+        out_shape=jax.ShapeDtypeStruct(lse.shape, lse.dtype),
+        debug=debug,
+        interpret=interpret,
+        name="mha_preprocess_backward",
+    )(out, do)
+    return delta
