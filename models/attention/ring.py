@@ -106,6 +106,8 @@ def _ring_attention_fwd(
             m_prev,
             l,
             sm_scale=sm_scale,
+            block_q=min(q_len, 128),
+            block_k=min(kv_len, 128),
         )
 
         k, v, kv_kwargs = rotate([k, v, kv_kwargs])
@@ -228,7 +230,7 @@ def ring_attention(
     bias_q_kwargs: dict[str, PyTree] | None = None,
     bias_kv_kwargs: dict[str, PyTree] | None = None,
     sm_scale: float | None = None,
-    block_impl: str = "jax",  # "jax", "pallas"
+    block_impl: str = "pallas",  # "jax", "pallas"
 ) -> Float[Array, "b lq h dv"]:
     """Ring attention - general.
 

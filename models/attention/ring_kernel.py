@@ -5,7 +5,6 @@ from __future__ import annotations
 import functools
 from typing import Any
 
-
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -107,8 +106,8 @@ def fwd_block(
     m: Float[Array, "b h lq"],
     l: Float[Array, "b h lq"],
     sm_scale: float,
-    block_q: int = 128,
-    block_k: int = 128,
+    block_q: int = 3,
+    block_k: int = 3,
     debug: bool = False,
     interpret: bool = True,
 ) -> tuple[
@@ -158,7 +157,9 @@ def fwd_block(
             )
         ),
         out_shape=[
-            jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),  # out
+            jax.ShapeDtypeStruct(  # out
+                shape=(batch_size, num_heads, q_len, dim_v), dtype=q.dtype
+            ),
             jax.ShapeDtypeStruct(  # m
                 shape=(batch_size, num_heads, q_len), dtype=jnp.float32
             ),
