@@ -38,7 +38,7 @@ def _mha_forward_kernel(
 
     # initialize o, l, m from incoming stats
     o = o_ref[...]
-    m_i = m_ref[...]  # TODO: slice???
+    m_i = m_ref[...]
     l_i = l_ref[...]
 
     # load q: it will stay in L1 throughput
@@ -174,3 +174,11 @@ def fwd_block(
         interpret=interpret,
         name="forward_block",
     )(q, k, v, bias, o, m, l)
+
+
+def _mha_backward_kernel():
+    # TODO:...
+    ...
+
+
+def bwd_block(): ...
