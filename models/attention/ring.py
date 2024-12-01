@@ -73,11 +73,15 @@ def _ring_attention_fwd(
     def scan_fn(carry, i: Int):
         o, l, m_prev, k, v, kv_kwargs = carry
 
-        s = einops.einsum(q, k, "b h lq dk, b h lk dk -> b h lq lk") * sm_scale
         if bias_fn is not None:
             assert bias_q_kwargs is not None
             assert kv_kwargs is not None
             bias = bias_fn(**bias_q_kwargs, **kv_kwargs)
+        else:
+            bias = None
+
+        s = einops.einsum(q, k, "b h lq dk, b h lk dk -> b h lq lk") * sm_scale
+        if bias is not None:
             s += bias
 
         m = jnp.maximum(m_prev, jnp.max(s, axis=-1))

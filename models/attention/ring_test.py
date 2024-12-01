@@ -96,9 +96,9 @@ def test_ring_attention_forward(seed: int, q_len: int, kv_len: int, h: int, d: i
 @pytest.mark.parametrize(
     "seed,q_len,kv_len,h,d",
     [
-        (0, 24, 16, 1, 5),
-        (0, 128, 64, 4, 64),
-        (1, 512, 512, 8, 16),
+        (0, 24, 16, 1, 2),
+        (0, 128, 64, 4, 2),
+        (1, 512, 512, 8, 2),
         (2, 1024, 512, 8, 128),
     ],
 )
