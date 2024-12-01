@@ -81,6 +81,10 @@ def mha_forward_kernel(
         #   qk = qk.astype(q_ref.dtype)
         #   qk = qk.astype(jnp.float32)
 
+        if bias_ref is not None:
+            bias = pl.load(bias_ref, (slice(None), curr_k_slice))
+            qk += bias
+
         if causal or segment_ids_ref is not None:
             mask = None
             if segment_ids_ref is not None:
@@ -99,10 +103,20 @@ def mha_forward_kernel(
         m_curr = qk.max(axis=-1)
         m_next = jnp.maximum(m_prev, m_curr)
         correction = jnp.exp(m_prev - m_next)
+
+        # correction = jnp.where(
+        #     jnp.isneginf(m_curr) & jnp.isneginf(m_prev), 0, correction
+        # )
+
         l_prev_corr = correction * l_prev
         s_curr = jnp.exp(
             qk - m_next[:, None]
         )  # Use m_next instead of m_curr to avoid a correction on l_curr
+
+        # s_curr = jnp.where(
+        #     jnp.isneginf(m_next)[..., None], 0, s_curr
+        # )  # if no data in this block
+
         l_curr = s_curr.sum(axis=-1)
         l_next = l_prev_corr + l_curr
         o_prev_corr = correction[:, None] * o_prev
@@ -194,6 +208,7 @@ def mha(
     num_warps_ = num_warps
     if num_warps_ is None:
         num_warps_ = 4 if head_dim <= 64 else 8
+
     kernel = functools.partial(
         mha_forward_kernel,
         num_heads=num_heads,
@@ -208,7 +223,13 @@ def mha(
         pl.BlockSpec((None, block_q, None, head_dim), lambda i, j, k: (j, i, k, 0)),
         pl.BlockSpec((None, kv_seq_len, None, head_dim), lambda _, j, k: (j, 0, k, 0)),
         pl.BlockSpec((None, kv_seq_len, None, head_dim), lambda _, j, k: (j, 0, k, 0)),
-        pl.BlockSpec((None, None, block_q, kv_seq_len), lambda i, j, k: (j, k, i, 0)),
+        (
+            pl.BlockSpec(
+                (None, None, block_q, kv_seq_len), lambda i, j, k: (j, k, i, 0)
+            )
+            if bias is not None
+            else None
+        ),
     ]
     in_specs.append(
         None  # type: ignore[arg-type]
@@ -283,7 +304,13 @@ def _mha_forward(
         pl.BlockSpec((None, block_q, None, head_dim), lambda i, j, k: (j, i, k, 0)),
         pl.BlockSpec((None, kv_seq_len, None, head_dim), lambda _, j, k: (j, 0, k, 0)),
         pl.BlockSpec((None, kv_seq_len, None, head_dim), lambda _, j, k: (j, 0, k, 0)),
-        pl.BlockSpec((None, None, block_q, kv_seq_len), lambda i, j, k: (j, k, i, 0)),
+        (
+            pl.BlockSpec(
+                (None, None, block_q, kv_seq_len), lambda i, j, k: (j, k, i, 0)
+            )
+            if bias is not None
+            else None
+        ),
     ]
     in_specs.append(
         None  # type: ignore[arg-type]
