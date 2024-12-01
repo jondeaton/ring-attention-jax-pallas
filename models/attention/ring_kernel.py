@@ -557,19 +557,16 @@ def _mha_backward(
         ]
 
         in_specs = [
-            pl.BlockSpec(
+            pl.BlockSpec(  # q
                 (None, q_seq_len, None, head_dim), lambda i, j, _: (i, 0, j, 0)
             ),
-            pl.BlockSpec(
+            pl.BlockSpec(  # k
                 (None, kv_seq_len, None, head_dim), lambda i, j, _: (i, 0, j, 0)
             ),
-            # pl.BlockSpec(
-            #     (None, None, q_seq_len, kv_seq_len), lambda i, j, k: (i, j, 0, k)
-            # ),
-            pl.BlockSpec(
+            pl.BlockSpec(  # v
                 (None, kv_seq_len, None, head_dim), lambda i, j, _: (i, 0, j, 0)
             ),
-            pl.BlockSpec(
+            pl.BlockSpec(  #
                 (None, q_seq_len, None, head_dim), lambda i, j, _: (i, 0, j, 0)
             ),
             pl.BlockSpec(
@@ -578,6 +575,7 @@ def _mha_backward(
             pl.BlockSpec((None, None, q_seq_len), lambda i, j, _: (i, j, 0)),
             pl.BlockSpec((None, None, q_seq_len), lambda i, j, _: (i, j, 0)),
         ]
+
         if segment_ids is None:
             in_specs.insert(3, None)  # type: ignore[arg-type]
         else:
