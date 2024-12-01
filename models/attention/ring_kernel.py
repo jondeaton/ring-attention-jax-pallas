@@ -373,6 +373,7 @@ def mha_backward_kernel(
     q_ref,
     k_ref,
     v_ref,
+    bias_ref,
     segment_ids_ref: jax.Array | None,
     out_ref,
     do_scaled_ref,
@@ -420,6 +421,12 @@ def mha_backward_kernel(
         qk = pl.dot(q, k.T)
         if sm_scale != 1.0:
             qk *= sm_scale
+
+        if bias_ref is not None:
+            # TODO: why do I have to index with curr_k_slice here but I don't have to
+            # index with curr_q_slice in forward??
+            bias = pl.load(bias_ref, (curr_q_slice, curr_k_slice))
+            qk += bias
 
         if causal or segment_ids_ref is not None:
             mask = None
@@ -484,6 +491,12 @@ def mha_backward_kernel(
         qk = pl.dot(q, k.T)
         if sm_scale != 1.0:
             qk *= sm_scale
+
+        if bias_ref is not None:
+            # TODO: why do I have to index with curr_k_slice here but I don't have to
+            # index with curr_q_slice in forward??
+            bias = pl.load(bias_ref, (curr_q_slice, curr_k_slice))
+            qk += bias
 
         if causal or segment_ids_ref is not None:
             mask = None
@@ -566,6 +579,14 @@ def _mha_backward(
             pl.BlockSpec(  # v
                 (None, kv_seq_len, None, head_dim), lambda i, j, _: (i, 0, j, 0)
             ),
+            (  # bias
+                pl.BlockSpec(
+                    (None, None, q_seq_len, kv_seq_len),
+                    lambda i, j, k: (i, j, 0, k),
+                )
+                if bias is not None
+                else None
+            ),
             (  # segment_ids
                 pl.BlockSpec((None, kv_seq_len), lambda i, j, _: (i, 0))
                 if segment_ids is not None
@@ -617,7 +638,7 @@ def _mha_backward(
             debug=debug,
             interpret=interpret,
             compiler_params=dict(triton=dict(num_warps=num_warps, num_stages=2)),
-        )(q, k, v, segment_ids, out, do, lse, delta)
+        )(q, k, v, bias, segment_ids, out, do, lse, delta)
     else:
         raise ValueError(f"Invalid backward pass implementation: {backward_pass_impl}")
     return dq.astype(q.dtype), dk, dv, None, None
