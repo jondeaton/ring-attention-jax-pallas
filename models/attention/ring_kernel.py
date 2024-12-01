@@ -66,18 +66,18 @@ def _mha_forward_kernel(
         m_next = jnp.maximum(m_prev, m_curr)
         correction = jnp.exp(m_prev - m_next)
 
-        # correction = jnp.where(
-        #     jnp.isneginf(m_curr) & jnp.isneginf(m_prev), 0, correction
-        # )
+        correction = jnp.where(
+            jnp.isneginf(m_curr) & jnp.isneginf(m_prev), 0, correction
+        )
 
         l_prev_corr = correction * l_prev
         s_curr = jnp.exp(
             qk - m_next[:, None]
         )  # Use m_next instead of m_curr to avoid a correction on l_curr
 
-        # s_curr = jnp.where(
-        #     jnp.isneginf(m_next)[..., None], 0, s_curr
-        # )  # if no data in this block
+        s_curr = jnp.where(
+            jnp.isneginf(m_next)[..., None], 0, s_curr
+        )  # if no data in this block
 
         l_curr = s_curr.sum(axis=-1)
         l_next = l_prev_corr + l_curr
@@ -106,8 +106,8 @@ def fwd_block(
     m: Float[Array, "b h lq"],
     l: Float[Array, "b h lq"],
     sm_scale: float,
-    block_q: int = 3,
-    block_k: int = 3,
+    block_q: int = 128,
+    block_k: int = 128,
     debug: bool = False,
     interpret: bool = True,
 ) -> tuple[
@@ -116,7 +116,10 @@ def fwd_block(
     Float[Array, "b h lq"],
 ]:
     batch_size, num_heads, q_len, dim_k = q.shape
-    _, _, kv_len, dim_v = v.shape
+    _, _, k_len, dim_v = v.shape
+
+    assert q_len % block_q == 0, (q_len, block_q)
+    assert k_len % block_k == 0, (k_len, block_k)
 
     kernel = functools.partial(
         _mha_forward_kernel,
@@ -132,11 +135,11 @@ def fwd_block(
         grid=(batch_size, num_heads, pl.cdiv(q_len, block_q)),
         in_specs=[
             pl.BlockSpec((None, None, block_q, dim_k), lambda b, h, lq: (b, h, lq, 0)),
-            pl.BlockSpec((None, None, kv_len, dim_k), lambda b, h, _: (b, h, 0, 0)),
-            pl.BlockSpec((None, None, kv_len, dim_v), lambda b, h, _: (b, h, 0, 0)),
+            pl.BlockSpec((None, None, k_len, dim_k), lambda b, h, _: (b, h, 0, 0)),
+            pl.BlockSpec((None, None, k_len, dim_v), lambda b, h, _: (b, h, 0, 0)),
             (
                 pl.BlockSpec(
-                    (None, None, block_q, kv_len), lambda b, h, lq: (b, h, lq, 0)
+                    (None, None, block_q, k_len), lambda b, h, lq: (b, h, lq, 0)
                 )
                 if bias is not None
                 else None

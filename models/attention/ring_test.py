@@ -45,8 +45,9 @@ def mha(
     [
         (0, 24, 24, 1, 5),
         (0, 128, 64, 4, 64),
-        (1, 512, 512, 8, 16),
-        (2, 1024, 512, 8, 128),
+        (1, 512, 512, 4, 16),
+        (2, 1024, 512, 4, 128),
+        (3, 2048, 2048, 4, 128),
     ],
 )
 def test_ring_attention_forward(seed: int, q_len: int, kv_len: int, h: int, d: int):
@@ -59,7 +60,7 @@ def test_ring_attention_forward(seed: int, q_len: int, kv_len: int, h: int, d: i
     )
     mesh = Mesh(device_mesh, axis_names=("dp", "sp"))
 
-    batch_size = 1
+    batch_size = 4
 
     keys = jax.random.split(key, 4)
     q = jax.random.normal(keys[0], shape=(batch_size, q_len, h, d))
@@ -96,10 +97,11 @@ def test_ring_attention_forward(seed: int, q_len: int, kv_len: int, h: int, d: i
 @pytest.mark.parametrize(
     "seed,q_len,kv_len,h,d",
     [
-        # (0, 24, 16, 1, 2),
-        # (0, 128, 64, 4, 2),
-        # (1, 512, 512, 8, 2),
-        # (2, 1024, 512, 8, 128),
+        (0, 24, 16, 1, 2),
+        (0, 128, 64, 4, 2),
+        (1, 512, 512, 8, 2),
+        (2, 1024, 512, 8, 128),
+        (3, 2048, 2048, 4, 128),
     ],
 )
 def test_ring_attention_backward(seed: int, q_len: int, kv_len: int, h: int, d: int):
@@ -160,10 +162,11 @@ def test_ring_attention_backward(seed: int, q_len: int, kv_len: int, h: int, d: 
 @pytest.mark.parametrize(
     "seed,q_len,kv_len,h,d",
     [
-        # (0, 24, 16, 1, 2),
-        # (0, 128, 64, 4, 64),
-        # (1, 512, 512, 8, 16),
-        # (2, 1024, 512, 8, 128),
+        (0, 24, 16, 1, 2),
+        (0, 128, 64, 4, 64),
+        (1, 512, 512, 4, 16),
+        (2, 1024, 512, 4, 128),
+        (2, 2048, 2048, 4, 128),
     ],
 )
 def test_ring_attention_bias(seed: int, q_len: int, kv_len: int, h: int, d: int):
@@ -176,7 +179,7 @@ def test_ring_attention_bias(seed: int, q_len: int, kv_len: int, h: int, d: int)
     )
     mesh = Mesh(device_mesh, axis_names=("dp", "sp"))
 
-    batch_size = 4
+    batch_size = 1
 
     keys = jax.random.split(key, 6)
     q = jax.random.normal(keys[0], shape=(batch_size, q_len, h, d))
@@ -298,10 +301,11 @@ def _test_bias_fn(
 @pytest.mark.parametrize(
     "seed,length,h,d",
     [
-        # (0, 16, 1, 2),
-        # (0, 128, 4, 64),
-        # (1, 512, 8, 16),
-        # (2, 1024, 8, 128),
+        (0, 16, 1, 2),
+        (0, 128, 4, 64),
+        (1, 512, 4, 16),
+        (2, 1024, 4, 64),
+        (3, 2048, 4, 64),
     ],
 )
 def test_ring_self_attention(seed: int, length: int, h: int, d: int):
