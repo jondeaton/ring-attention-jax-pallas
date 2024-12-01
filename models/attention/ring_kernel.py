@@ -566,20 +566,22 @@ def _mha_backward(
             pl.BlockSpec(  # v
                 (None, kv_seq_len, None, head_dim), lambda i, j, _: (i, 0, j, 0)
             ),
-            pl.BlockSpec(  #
+            (  # segment_ids
+                pl.BlockSpec((None, kv_seq_len), lambda i, j, _: (i, 0))
+                if segment_ids is not None
+                else None
+            ),
+            pl.BlockSpec(  # o
                 (None, q_seq_len, None, head_dim), lambda i, j, _: (i, 0, j, 0)
             ),
-            pl.BlockSpec(
+            pl.BlockSpec(  # do
                 (None, q_seq_len, None, head_dim), lambda i, j, _: (i, 0, j, 0)
             ),
+            # lse
             pl.BlockSpec((None, None, q_seq_len), lambda i, j, _: (i, j, 0)),
+            # delta
             pl.BlockSpec((None, None, q_seq_len), lambda i, j, _: (i, j, 0)),
         ]
-
-        if segment_ids is None:
-            in_specs.insert(3, None)  # type: ignore[arg-type]
-        else:
-            in_specs.insert(3, pl.BlockSpec((None, kv_seq_len), lambda i, j, _: (i, 0)))
 
         grid = (batch_size, num_heads, pl.cdiv(kv_seq_len, block_k))
         num_warps = 8
