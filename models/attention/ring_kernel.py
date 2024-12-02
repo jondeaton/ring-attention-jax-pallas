@@ -1,4 +1,29 @@
-"""Pallas kernels for on-device ring-attention."""
+"""Pallas kernels for on-device ring-attention.
+
+This code was adapted from the JAX project (https://github.com/google/jax) in
+particular:
+https://github.com/jax-ml/jax/blob/main/jax/experimental/pallas/ops/gpu/attention.py
+
+Significant modifications have been made:
+    1. support for arbitrary attention bias
+    2. output block-wise stats and change interface for use in ring attention.
+
+The original copyright:
+"""
+
+# Copyright 2023 The JAX Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from __future__ import annotations
 
@@ -8,7 +33,6 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import triton as plgpu
 
 from jaxtyping import Float, Array
 
@@ -40,8 +64,6 @@ def _mha_forward_kernel(
     o = o_ref[...]
     m_i = m_ref[...]
     l_i = l_ref[...]
-
-    # load q: it will stay in L1 throughput
     q = q_ref[...]
 
     def body(start_k, carry):
@@ -197,7 +219,7 @@ def bwd_block(
     assert q_len % block_q == 0, (q_len, block_q)
     assert k_len % block_k == 0, (k_len, block_k)
 
-    delta = _preprocess_backward(o, do, L, block_q, debug, interpret)
+    delta = _precompute_delta(o, do, L, block_q, debug, interpret)
 
     dq, dk, dv = pl.pallas_call(
         functools.partial(
@@ -261,90 +283,6 @@ def bwd_block(
     return dq.astype(q.dtype), dk, dv
 
 
-def __bwd_kernel(
-    # Inputs
-    q_ref,
-    k_ref,
-    v_ref,
-    bias_ref,
-    out_ref,
-    lse_ref,
-    do_scaled_ref,
-    delta_ref,
-    # Outputs
-    dq_ref,
-    dk_ref,
-    dv_ref,
-    *,
-    sm_scale: float,
-    block_q1: int,
-    block_k1: int,
-    # block_q2: int,
-    # block_k2: int,
-    block_d: int,
-):
-    q_len = q_ref.shape[0]
-    k_len = k_ref.shape[0]
-
-    # Scan #1: dK and dV
-    #   1. Load a block of K and V of size (block_k1, head_dim) in SMEM.
-    #   2. Iterate through Q in chunks of (block_q1, head_dim) to accumulate
-    #      dK and dV.
-    start_k = pl.program_id(2)
-    curr_k_slice = pl.dslice(start_k * block_k1, block_k1)
-
-    dq = jnp.zeros([block_q1, block_d], dtype=jnp.float32)
-    dv = jnp.zeros([block_k1, block_d], dtype=jnp.float32)
-    dk = jnp.zeros([block_k1, block_d], dtype=jnp.float32)
-
-    k = pl.load(k_ref, (curr_k_slice, slice(None)))
-    v = pl.load(v_ref, (curr_k_slice, slice(None)))
-
-    def scan_fn(start_q, carry):
-        dq, dk, dv = carry
-        curr_q_slice = pl.dslice(start_q * block_q1, block_q1)
-
-        q = pl.load(q_ref, (curr_q_slice, slice(None)))
-        qk = pl.dot(q, k.T)
-        if sm_scale != 1.0:
-            qk *= sm_scale
-
-        if bias_ref is not None:
-            # TODO: why do I have to index with curr_k_slice here but I don't have to
-            # index with curr_q_slice in forward??
-            bias = pl.load(bias_ref, (curr_q_slice, curr_k_slice))
-            qk += bias
-
-        lse = pl.load(lse_ref, (curr_q_slice,))
-        di = pl.load(delta_ref, (curr_q_slice,))
-        do = pl.load(do_scaled_ref, (curr_q_slice, slice(None)))
-
-        p = jnp.exp(qk - lse[:, None])
-        dv = dv + pl.dot(p.astype(do.dtype).T, do)
-
-        # if computing delta on the fly
-        # o = pl.load(out_ref, (curr_q_slice, slice(None)))
-        # di = jnp.sum(do * o, axis=1)
-        # pl.debug_print("di", di)
-
-        dp = jnp.zeros((block_q1, block_k1), dtype=jnp.float32) - di[:, None]
-        dp = dp + pl.dot(do, v.T)
-        ds = p * dp
-        if sm_scale != 1.0:
-            ds = ds * sm_scale
-
-        dq = dq + pl.dot(ds.astype(k_ref.dtype), k)
-        dk = dk + pl.dot(ds.astype(q_ref.dtype).T, q)
-
-        return dq, dk, dv
-
-    dq, dk, dv = jax.lax.fori_loop(0, pl.cdiv(q_len, block_q1), scan_fn, (dq, dk, dv))
-
-    dq_ref[...] = dq.astype(dq_ref.dtype)
-    dk_ref[...] = dk.astype(dk_ref.dtype)
-    dv_ref[...] = dv.astype(dv_ref.dtype)
-
-
 # This kernel computes dK_i, dV_i and dQ_i in parallel across the sequence
 # length.
 # Inspired by the triton tutorial: https://github.com/triton-lang/triton/blob/main/python/tutorials/06-fused-attention.py
@@ -386,7 +324,6 @@ def _bwd_kernel(
 
     v = pl.load(v_ref, (curr_k_slice, slice(None)))
     k = pl.load(k_ref, (curr_k_slice, slice(None)))
-    span_k = start_k * block_k1 + jnp.arange(block_k1)
 
     def inner_loop_dkdv(start_q, carry):
         dv, dk = carry
@@ -398,8 +335,6 @@ def _bwd_kernel(
             qk *= sm_scale
 
         if bias_ref is not None:
-            # TODO: why do I have to index with curr_k_slice here but I don't have to
-            # index with curr_q_slice in forward??
             bias = pl.load(bias_ref, (curr_q_slice, curr_k_slice))
             qk += bias
 
@@ -422,8 +357,6 @@ def _bwd_kernel(
     dv_ref[...] = dv.astype(dv_ref.dtype)
     dk_ref[...] = dk.astype(dk_ref.dtype)
 
-    # pl.debug_print("dk", dk)
-    # pl.debug_print("dv", dv)
     del dv, dk
 
     # Scan #2: dQ
@@ -450,8 +383,6 @@ def _bwd_kernel(
             qk *= sm_scale
 
         if bias_ref is not None:
-            # TODO: why do I have to index with curr_k_slice here but I don't have to
-            # index with curr_q_slice in forward??
             bias = pl.load(bias_ref, (curr_q_slice, curr_k_slice))
             qk += bias
 
@@ -472,23 +403,17 @@ def _bwd_kernel(
     dq_ref[...] = dq.astype(dq_ref.dtype)
 
 
-def _preprocess_backward_kernel(out_ref, dout_ref, delta_ref):
-    # load
-    o = out_ref[...].astype(jnp.float32)
-    do = dout_ref[...].astype(jnp.float32)
-    # compute
-    delta = jnp.sum(o * do, axis=1)
-    # write-back
-    delta_ref[...] = delta.astype(delta_ref.dtype)
-
-
-@jax.named_scope("preprocess_backward")
-def _preprocess_backward(out, do, lse, block_q: int, debug: bool, interpret: bool):
+def _precompute_delta(out, do, lse, block_q: int, debug: bool, interpret: bool):
     batch_size, num_heads, seq_len, head_dim = out.shape
 
-    delta = pl.pallas_call(
-        _preprocess_backward_kernel,
-        # grid=(pl.cdiv(seq_len, block_q), batch_size, num_heads),
+    def kernel(out_ref, dout_ref, delta_ref):
+        o = out_ref[...].astype(jnp.float32)
+        do = dout_ref[...].astype(jnp.float32)
+        delta = jnp.sum(o * do, axis=1)
+        delta_ref[...] = delta.astype(delta_ref.dtype)
+
+    return pl.pallas_call(
+        kernel,
         grid=(batch_size, num_heads, pl.cdiv(seq_len, block_q)),
         in_specs=[
             pl.BlockSpec((None, None, block_q, head_dim), lambda b, h, l: (b, h, l, 0)),
@@ -499,6 +424,5 @@ def _preprocess_backward(out, do, lse, block_q: int, debug: bool, interpret: boo
         out_shape=jax.ShapeDtypeStruct(lse.shape, lse.dtype),
         debug=debug,
         interpret=interpret,
-        name="mha_preprocess_backward",
+        name="precompute_delta",
     )(out, do)
-    return delta
