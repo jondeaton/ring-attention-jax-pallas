@@ -271,6 +271,8 @@ def ring_attention(
             segment_ids for the query sequence.
         bias_kv_kwargs: kwargs to bias_fn with key/value-aligned sharded arrays. For
             example segment_ids for the key/value sequence.
+        block_impl: implementation choice for single-block attention, either "jax" or
+            "pallas" to use fused kernels in pallas.
     Returns:
         Attention output (sharded).
     """

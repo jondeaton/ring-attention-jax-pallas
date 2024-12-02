@@ -209,6 +209,7 @@ def bwd_block(
             block_k2=block_k,
             block_d=dim_k,
         ),
+        # TODO: does this grid order have performance implications?
         grid=(batch_size, num_heads, pl.cdiv(k_len, block_k)),
         in_specs=[
             pl.BlockSpec(  # q

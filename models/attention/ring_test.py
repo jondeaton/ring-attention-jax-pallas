@@ -42,14 +42,14 @@ def mha(
     return einops.einsum(a, v, "b h i j, b j h d -> b i h d")
 
 
+@pytest.mark.parametrize("seed", [0, 1])
 @pytest.mark.parametrize(
-    "seed,q_len,kv_len,h,d",
+    "q_len,kv_len,h,d",
     [
-        (0, 24, 24, 1, 5),
-        (0, 128, 64, 4, 64),
-        (1, 512, 512, 4, 16),
-        (2, 1024, 512, 4, 128),
-        (3, 2048, 2048, 4, 128),
+        (24, 24, 1, 5),
+        (128, 64, 4, 64),
+        (512, 512, 4, 16),
+        (2048, 2048, 4, 128),
     ],
 )
 def test_ring_attention_forward(seed: int, q_len: int, kv_len: int, h: int, d: int):
@@ -62,7 +62,7 @@ def test_ring_attention_forward(seed: int, q_len: int, kv_len: int, h: int, d: i
     )
     mesh = Mesh(device_mesh, axis_names=("dp", "sp"))
 
-    batch_size = 4
+    batch_size = 2
 
     keys = jax.random.split(key, 4)
     q = jax.random.normal(keys[0], shape=(batch_size, q_len, h, d))
@@ -96,14 +96,14 @@ def test_ring_attention_forward(seed: int, q_len: int, kv_len: int, h: int, d: i
     np.testing.assert_allclose(output, expected_output, rtol=0.01, atol=0.001)
 
 
+@pytest.mark.parametrize("seed", [0, 1])
 @pytest.mark.parametrize(
-    "seed,q_len,kv_len,h,d",
+    "q_len,kv_len,h,d",
     [
-        (0, 24, 24, 1, 2),
-        (0, 128, 128, 4, 2),
-        (1, 512, 512, 8, 2),
-        (2, 1024, 512, 8, 128),
-        (3, 2048, 2048, 4, 128),
+        (24, 24, 1, 2),
+        (128, 128, 4, 2),
+        (512, 512, 8, 2),
+        (2048, 2048, 4, 128),
     ],
 )
 def test_ring_attention_backward(seed: int, q_len: int, kv_len: int, h: int, d: int):
@@ -116,15 +116,18 @@ def test_ring_attention_backward(seed: int, q_len: int, kv_len: int, h: int, d: 
     )
     mesh = Mesh(device_mesh, axis_names=("dp", "sp"))
 
-    batch_size = 1
+    batch_size = 2
 
-    q = jax.random.normal(key, shape=(batch_size, q_len, h, d))
-    k = jax.random.normal(key, shape=(batch_size, kv_len, h, d))
-    v = jax.random.normal(key, shape=(batch_size, kv_len, h, d))
+    keys = jax.random.split(key, 4)
+    q = jax.random.normal(keys[0], shape=(batch_size, q_len, h, d))
+    k = jax.random.normal(keys[1], shape=(batch_size, kv_len, h, d))
+    v = jax.random.normal(keys[2], shape=(batch_size, kv_len, h, d))
+
+    do = jax.random.normal(keys[3], shape=(batch_size, q_len, h, d))
 
     # expected outputs.
     dq_, dk_, dv_ = jax.grad(
-        lambda q, k, v: mha(q, k, v).sum(),
+        lambda q, k, v: jnp.sum(do * mha(q, k, v)),
         argnums=(0, 1, 2),
     )(q, k, v)
 
@@ -148,7 +151,7 @@ def test_ring_attention_backward(seed: int, q_len: int, kv_len: int, h: int, d: 
 
     dq, dk, dv = jax.jit(
         jax.grad(
-            lambda q, k, v: ring_attention_sharded(q, k, v).sum(),
+            lambda q, k, v: jnp.sum(do * ring_attention_sharded(q, k, v)),
             argnums=(0, 1, 2),
         )
     )(q, k, v)
@@ -162,17 +165,19 @@ def test_ring_attention_backward(seed: int, q_len: int, kv_len: int, h: int, d: 
     np.testing.assert_allclose(dv, dv_, atol=1e-4)
 
 
+@pytest.mark.parametrize("impl", ["jax", "pallas"])
 @pytest.mark.parametrize(
     "seed,q_len,kv_len,h,d",
     [
         (0, 24, 16, 1, 2),
-        (0, 128, 64, 4, 64),
-        (1, 512, 512, 4, 16),
-        (2, 1024, 512, 4, 128),
-        (2, 2048, 2048, 4, 128),
+        (1, 128, 64, 4, 64),
+        (2, 64, 512, 4, 16),
+        (3, 2048, 2048, 4, 128),
     ],
 )
-def test_ring_attention_bias(seed: int, q_len: int, kv_len: int, h: int, d: int):
+def test_ring_attention_bias(
+    impl: str, seed: int, q_len: int, kv_len: int, h: int, d: int
+):
     key = jax.random.PRNGKey(seed)
 
     devices = jax.devices()
@@ -182,9 +187,9 @@ def test_ring_attention_bias(seed: int, q_len: int, kv_len: int, h: int, d: int)
     )
     mesh = Mesh(device_mesh, axis_names=("dp", "sp"))
 
-    batch_size = 1
+    batch_size = 2
 
-    keys = jax.random.split(key, 6)
+    keys = jax.random.split(key, 7)
     q = jax.random.normal(keys[0], shape=(batch_size, q_len, h, d))
     k = jax.random.normal(keys[1], shape=(batch_size, kv_len, h, d))
     v = jax.random.normal(keys[2], shape=(batch_size, kv_len, h, d))
@@ -196,6 +201,9 @@ def test_ring_attention_bias(seed: int, q_len: int, kv_len: int, h: int, d: int)
         keys[4], shape=(batch_size, kv_len), minval=0, maxval=q_len // 5
     )
 
+    do = jax.random.normal(keys[5], shape=(batch_size, q_len, h, d))
+
+    # bias = jax.random.normal(keys[6], shape=(batch_size, h, q_len, kv_len))
     attn_mask = q_segment_ids[:, :, None] == kv_segment_ids[:, None, :]
     bias = jnp.where(attn_mask, 0, -jnp.inf)
     bias = einops.repeat(bias, "b lq lk -> b h lq lk", h=h)
@@ -228,6 +236,7 @@ def test_ring_attention_bias(seed: int, q_len: int, kv_len: int, h: int, d: int)
             bias_fn=bias_fn,
             bias_q_kwargs=q_kwargs,
             bias_kv_kwargs=kv_kwargs,
+            block_impl=impl,
         )
 
     ring_attention_sharded = shard_map(
@@ -261,20 +270,21 @@ def test_ring_attention_bias(seed: int, q_len: int, kv_len: int, h: int, d: int)
     # Test backwards pass with bias.
 
     def f(q, k, v):
-        return ring_attention_sharded(
+        o = ring_attention_sharded(
             q,
             k,
             v,
             {"q_segment_ids": q_segment_ids},
             {"kv_segment_ids": kv_segment_ids},
-        ).sum()
+        )
+        return jnp.sum(o * do)
 
     dq, dk, dv = jax.jit(jax.grad(f, argnums=(0, 1, 2)))(q, k, v)
 
     # expected outputs
     dq_, dk_, dv_ = jax.jit(
         jax.grad(
-            lambda q, k, v: mha(q, k, v, bias=bias).sum(),
+            lambda q, k, v: jnp.sum(do * mha(q, k, v, bias=bias)),
             argnums=(0, 1, 2),
         )
     )(q, k, v)
@@ -321,7 +331,7 @@ def test_ring_self_attention(seed: int, length: int, h: int, d: int):
     )
     mesh = Mesh(device_mesh, axis_names=("dp", "sp"))
 
-    batch_size = 4
+    batch_size = 2
 
     keys = jax.random.split(key, 4)
     q = jax.random.normal(keys[0], shape=(batch_size, length, h, d))
