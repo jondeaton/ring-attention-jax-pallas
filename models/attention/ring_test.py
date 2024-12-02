@@ -42,17 +42,19 @@ def mha(
     return einops.einsum(a, v, "b h i j, b j h d -> b i h d")
 
 
-@pytest.mark.parametrize("seed", [0, 1])
+@pytest.mark.parametrize("impl", ["jax", "pallas"])
 @pytest.mark.parametrize(
-    "q_len,kv_len,h,d",
+    "seed,q_len,kv_len,h,d",
     [
-        (24, 24, 1, 5),
-        (128, 64, 4, 64),
-        (512, 512, 4, 16),
-        (2048, 2048, 4, 128),
+        (0, 24, 16, 1, 2),
+        (1, 128, 64, 4, 64),
+        (2, 64, 512, 4, 16),
+        (3, 2048, 2048, 4, 128),
     ],
 )
-def test_ring_attention_forward(seed: int, q_len: int, kv_len: int, h: int, d: int):
+def test_ring_attention_forward(
+    impl: str, seed: int, q_len: int, kv_len: int, h: int, d: int
+):
     key = jax.random.PRNGKey(seed)
 
     devices = jax.devices()
@@ -79,7 +81,7 @@ def test_ring_attention_forward(seed: int, q_len: int, kv_len: int, h: int, d: i
 
     ring_attention_sharded = jax.jit(
         shard_map(
-            functools.partial(ring_attention, axis_name="sp"),
+            functools.partial(ring_attention, axis_name="sp", block_impl=impl),
             mesh=mesh,
             in_specs=(
                 PartitionSpec("dp", "sp", None),  # q
@@ -96,17 +98,19 @@ def test_ring_attention_forward(seed: int, q_len: int, kv_len: int, h: int, d: i
     np.testing.assert_allclose(output, expected_output, rtol=0.01, atol=0.001)
 
 
-@pytest.mark.parametrize("seed", [0, 1])
+@pytest.mark.parametrize("impl", ["jax", "pallas"])
 @pytest.mark.parametrize(
-    "q_len,kv_len,h,d",
+    "seed,q_len,kv_len,h,d",
     [
-        (24, 24, 1, 2),
-        (128, 128, 4, 2),
-        (512, 512, 8, 2),
-        (2048, 2048, 4, 128),
+        (0, 24, 16, 1, 2),
+        (1, 128, 64, 4, 64),
+        (2, 64, 512, 4, 16),
+        (3, 2048, 2048, 4, 128),
     ],
 )
-def test_ring_attention_backward(seed: int, q_len: int, kv_len: int, h: int, d: int):
+def test_ring_attention_backward(
+    impl: str, seed: int, q_len: int, kv_len: int, h: int, d: int
+):
     key = jax.random.PRNGKey(seed)
 
     devices = jax.devices()
@@ -138,7 +142,7 @@ def test_ring_attention_backward(seed: int, q_len: int, kv_len: int, h: int, d: 
     v = jax.device_put(v, sharding)
 
     ring_attention_sharded = shard_map(
-        functools.partial(ring_attention, axis_name="sp"),
+        functools.partial(ring_attention, axis_name="sp", block_impl=impl),
         mesh=mesh,
         in_specs=(
             PartitionSpec("dp", "sp", None),  # q
@@ -311,17 +315,17 @@ def _test_bias_fn(
     return jnp.where(mask, 0, -jnp.inf)
 
 
+@pytest.mark.parametrize("impl", ["jax", "pallas"])
 @pytest.mark.parametrize(
     "seed,length,h,d",
     [
         (0, 16, 1, 2),
-        (0, 128, 4, 64),
-        (1, 512, 4, 16),
-        (2, 1024, 4, 64),
-        (3, 2048, 4, 64),
+        (1, 128, 4, 64),
+        (2, 512, 4, 16),
+        (4, 2048, 4, 64),
     ],
 )
-def test_ring_self_attention(seed: int, length: int, h: int, d: int):
+def test_ring_self_attention(impl: str, seed: int, length: int, h: int, d: int):
     key = jax.random.PRNGKey(seed)
 
     devices = jax.devices()
@@ -356,7 +360,7 @@ def test_ring_self_attention(seed: int, length: int, h: int, d: int):
 
     output = jax.jit(
         ring_self_attention,
-        static_argnames=["mesh", "pspec", "causal"],
+        static_argnames=["mesh", "pspec", "causal", "block_impl"],
     )(
         q,
         k,
@@ -366,6 +370,7 @@ def test_ring_self_attention(seed: int, length: int, h: int, d: int):
         segment_ids=segment_ids,
         positions=positions,
         causal=True,
+        block_impl=impl,
     )
 
     np.testing.assert_allclose(output, expected_output, rtol=0.01, atol=0.001)

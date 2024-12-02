@@ -328,6 +328,7 @@ def ring_self_attention(
     segment_ids: Int[Array, "b l"] | None = None,
     positions: Int[Array, "b l"] | None = None,
     prefix_mask: Bool[Array, "b l"] | None = None,
+    block_impl: str = "pallas",
 ) -> Float[Array, "b l h dv"]:
     """Ring attention for self-attention.
 
@@ -352,6 +353,7 @@ def ring_self_attention(
         segment_ids: for block-sparse self-attention eg. for packed-sample attention.
         positions: for causal attention, indicates the position of each token.
         prefix_mask: for prefixlm, indicates which positions in the prefix.
+        block_impl: choice of implementation for block-wise attention, "jax" or "pallas"
     Returns:
         single block of output sharded along the length dimension.
     """
@@ -421,6 +423,7 @@ def ring_self_attention(
             bias_fn=bias_fn,
             bias_q_kwargs=bias_q_kwargs,
             bias_kv_kwargs=bias_kv_kwargs,
+            block_impl=block_impl,
         )
 
     return shard_map(
