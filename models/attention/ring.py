@@ -339,7 +339,7 @@ def ring_self_attention(
         - prefixlm attention via prefix_mask (requires positions)
 
     This "full-service" implementation also wraps the general ring attention function
-    wish shard_map so requires `mesh` and `pspec` arguments. Thus it also serves as an
+    with shard_map so requires `mesh` and `pspec` arguments. Thus it also serves as an
     exmaple of how to use the general single-shard ring_attention function.
 
     Args:

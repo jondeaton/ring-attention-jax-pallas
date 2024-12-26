@@ -221,6 +221,10 @@ def bwd_block(
 
     delta = _precompute_delta(o, do, L, block_q, debug, interpret)
 
+    # initialize dq and use input aliasing https://github.com/jax-ml/jax/discussions/23272
+    # since we'll be writing to dq in parallel with atomic_add
+    dq = jnp.zeros_like(q)
+
     dq, dk, dv = pl.pallas_call(
         functools.partial(
             _bwd_kernel,
@@ -254,6 +258,9 @@ def bwd_block(
                 (None, None, q_len, dim_k), lambda b, h, _: (b, h, 0, 0)
             ),
             pl.BlockSpec((None, None, q_len), lambda i, j, _: (i, j, 0)),  # delta
+            pl.BlockSpec(
+                (None, None, q_len, dim_k), lambda i, j, _: (i, j, 0, 0)
+            ),  # dq
         ],
         out_shape=[
             jax.ShapeDtypeStruct(q.shape, q.dtype),
@@ -274,11 +281,12 @@ def bwd_block(
                 lambda i, j, k: (i, j, k, 0),  # dv
             ),
         ],
+        input_output_aliases={8 if bias is not None else 7: 0},
         name="mha_backward",
         debug=debug,
         interpret=interpret,
         compiler_params=dict(triton=dict(num_warps=8, num_stages=2)),
-    )(q, k, v, bias, o, L, do, delta)
+    )(q, k, v, bias, o, L, do, delta, dq)
 
     return dq.astype(q.dtype), dk, dv
 
@@ -296,6 +304,7 @@ def _bwd_kernel(
     lse_ref,
     do_scaled_ref,
     delta_ref,
+    dq_alias,  # dq alias
     # Outputs
     dq_ref,
     dk_ref,
@@ -351,6 +360,12 @@ def _bwd_kernel(
             ds = ds * sm_scale
         dk = dk + pl.dot(ds.astype(q_ref.dtype).T, q)
 
+        # eliminate second loop over q by computing dq and writing to write-contended
+        # dq with atomic add
+        # TODO: why not matching...?
+        dq = pl.dot(ds.astype(k_ref.dtype), k)
+        pl.atomic_add(dq_ref, (curr_q_slice, slice(None)), dq)
+
         return dv, dk
 
     dv, dk = jax.lax.fori_loop(0, pl.cdiv(q_len, block_q1), inner_loop_dkdv, (dv, dk))
@@ -363,44 +378,44 @@ def _bwd_kernel(
     #   1. Load a block of Q of size (block_q2, head_dim) in SMEM.
     #   2. Iterate through K and V in chunks of (block_k2, head_dim) to
     #     accumulate dQ.
-    start_q = pl.program_id(2)
-    curr_q_slice = pl.ds(start_q * block_q2, block_q2)
-    span_q = start_q * block_q2 + jnp.arange(block_q2)
-    dq = jnp.zeros([block_q2, block_d], dtype=jnp.float32)
-
-    q = pl.load(q_ref, (curr_q_slice, slice(None)))
-    lse = pl.load(lse_ref, (curr_q_slice,))
-    do = pl.load(do_scaled_ref, (curr_q_slice, slice(None)))
-    di = pl.load(delta_ref, (curr_q_slice,))
-
-    def inner_loop_dq(start_k, dq):
-        curr_k_slice = pl.dslice(start_k * block_k2, block_k2)
-        k = pl.load(k_ref, (curr_k_slice, slice(None)))
-        v = pl.load(v_ref, (curr_k_slice, slice(None)))
-
-        qk = pl.dot(q, k.T)
-        if sm_scale != 1.0:
-            qk *= sm_scale
-
-        if bias_ref is not None:
-            bias = pl.load(bias_ref, (curr_q_slice, curr_k_slice))
-            qk += bias
-
-        p = jnp.exp(qk - lse[:, None])
-        dp = jnp.zeros((block_q2, block_k2), dtype=jnp.float32) - di[:, None]
-        dp = dp + pl.dot(do, v.T)
-        ds = p * dp
-        if sm_scale != 1.0:
-            ds = ds * sm_scale
-
-        dq = dq + pl.dot(ds.astype(k.dtype), k).astype(dq.dtype)
-
-        return dq
-
-    upper_bound = pl.cdiv(k_len, block_k2)
-
-    dq = jax.lax.fori_loop(0, upper_bound, inner_loop_dq, (dq))
-    dq_ref[...] = dq.astype(dq_ref.dtype)
+    # start_q = pl.program_id(2)
+    # curr_q_slice = pl.ds(start_q * block_q2, block_q2)
+    # span_q = start_q * block_q2 + jnp.arange(block_q2)
+    # dq = jnp.zeros([block_q2, block_d], dtype=jnp.float32)
+    #
+    # q = pl.load(q_ref, (curr_q_slice, slice(None)))
+    # lse = pl.load(lse_ref, (curr_q_slice,))
+    # do = pl.load(do_scaled_ref, (curr_q_slice, slice(None)))
+    # di = pl.load(delta_ref, (curr_q_slice,))
+    #
+    # def inner_loop_dq(start_k, dq):
+    #     curr_k_slice = pl.dslice(start_k * block_k2, block_k2)
+    #     k = pl.load(k_ref, (curr_k_slice, slice(None)))
+    #     v = pl.load(v_ref, (curr_k_slice, slice(None)))
+    #
+    #     qk = pl.dot(q, k.T)
+    #     if sm_scale != 1.0:
+    #         qk *= sm_scale
+    #
+    #     if bias_ref is not None:
+    #         bias = pl.load(bias_ref, (curr_q_slice, curr_k_slice))
+    #         qk += bias
+    #
+    #     p = jnp.exp(qk - lse[:, None])
+    #     dp = jnp.zeros((block_q2, block_k2), dtype=jnp.float32) - di[:, None]
+    #     dp = dp + pl.dot(do, v.T)
+    #     ds = p * dp
+    #     if sm_scale != 1.0:
+    #         ds = ds * sm_scale
+    #
+    #     dq = dq + pl.dot(ds.astype(k.dtype), k).astype(dq.dtype)
+    #
+    #     return dq
+    #
+    # upper_bound = pl.cdiv(k_len, block_k2)
+    #
+    # dq = jax.lax.fori_loop(0, upper_bound, inner_loop_dq, (dq))
+    # dq_ref[...] = dq.astype(dq_ref.dtype)
 
 
 def _precompute_delta(out, do, lse, block_q: int, debug: bool, interpret: bool):
