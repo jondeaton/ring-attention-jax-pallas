@@ -175,9 +175,10 @@ def _ring_attention_bwd(
 
     def scan_fn(carry, i: Int):
         q, o, dq, dk, dv, do, L, bias_q_kwargs = carry
-        bias = (
-            bias_fn(**bias_q_kwargs, **bias_kv_kwargs) if bias_fn is not None else None
-        )
+        if bias_fn is not None:
+            bias = bias_fn(**bias_q_kwargs, **bias_kv_kwargs)
+        else:
+            bias = None
 
         dq_, dk_, dv_ = bwd_block_fn(q, k, v, bias, o, L, do, sm_scale)
         dq += dq_
