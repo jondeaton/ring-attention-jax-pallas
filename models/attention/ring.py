@@ -175,9 +175,10 @@ def _ring_attention_bwd(
 
     def scan_fn(carry, i: Int):
         q, o, dq, dk, dv, do, L, bias_q_kwargs = carry
-        bias = (
-            bias_fn(**bias_q_kwargs, **bias_kv_kwargs) if bias_fn is not None else None
-        )
+        if bias_fn is not None:
+            bias = bias_fn(**bias_q_kwargs, **bias_kv_kwargs)
+        else:
+            bias = None
 
         dq_, dk_, dv_ = bwd_block_fn(q, k, v, bias, o, L, do, sm_scale)
         dq += dq_
@@ -339,7 +340,7 @@ def ring_self_attention(
         - prefixlm attention via prefix_mask (requires positions)
 
     This "full-service" implementation also wraps the general ring attention function
-    wish shard_map so requires `mesh` and `pspec` arguments. Thus it also serves as an
+    with shard_map so requires `mesh` and `pspec` arguments. Thus it also serves as an
     exmaple of how to use the general single-shard ring_attention function.
 
     Args:

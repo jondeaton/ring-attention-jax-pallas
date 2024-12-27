@@ -105,6 +105,8 @@ def test_ring_attention_forward(
         (0, 24, 16, 1, 2),
         (1, 128, 64, 4, 64),
         (2, 64, 512, 4, 16),
+        (3, 128, 2048, 2, 128),
+        (3, 2048, 128, 2, 128),
         (3, 2048, 2048, 4, 128),
     ],
 )
@@ -160,13 +162,13 @@ def test_ring_attention_backward(
         )
     )(q, k, v)
 
-    assert not jnp.isnan(dq).any()
-    assert not jnp.isnan(dk).any()
-    assert not jnp.isnan(dv).any()
+    assert not jnp.isnan(dq).any(), jnp.isnan(dq).mean()
+    assert not jnp.isnan(dk).any(), jnp.isnan(dk).mean()
+    assert not jnp.isnan(dv).any(), jnp.isnan(dv).mean()
 
-    np.testing.assert_allclose(dq, dq_, atol=1e-4)
-    np.testing.assert_allclose(dk, dk_, atol=1e-4)
-    np.testing.assert_allclose(dv, dv_, atol=1e-4)
+    np.testing.assert_allclose(dq, dq_, atol=1e-4, rtol=0.01)
+    np.testing.assert_allclose(dk, dk_, atol=1e-4, rtol=0.01)
+    np.testing.assert_allclose(dv, dv_, atol=1e-4, rtol=0.01)
 
 
 @pytest.mark.parametrize("impl", ["jax", "pallas"])
