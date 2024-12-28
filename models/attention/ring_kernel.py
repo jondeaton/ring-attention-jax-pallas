@@ -55,10 +55,9 @@ def _fwd_kernel(
     block_d: int,
     block_k: int,
 ):
-    q_len = q_ref.shape[0]
     kv_len = k_ref.shape[0]
 
-    start_q = pl.program_id(0)
+    start_q = pl.program_id(2)
     curr_q_slice = pl.dslice(start_q * block_q, block_q)
 
     # initialize o, l, m from incoming stats
@@ -69,9 +68,9 @@ def _fwd_kernel(
 
     def body(start_k, carry):
         o_prev, m_prev, l_prev = carry
-        curr_k_slice = pl.dslice(start_k * block_k, block_k)
+        k_slice = pl.dslice(start_k * block_k, block_k)
 
-        k = pl.load(k_ref, (curr_k_slice, slice(None)))
+        k = pl.load(k_ref, (k_slice, slice(None)))
         qk = pl.dot(q, k.T)  # [block_q, block_k]
         if sm_scale != 1.0:
             qk *= sm_scale  # [block_q, block_k]
@@ -82,7 +81,7 @@ def _fwd_kernel(
         #   qk = qk.astype(jnp.float32)
 
         if bias_ref is not None:
-            bias = pl.load(bias_ref, (slice(None), curr_k_slice))
+            bias = pl.load(bias_ref, (slice(None), k_slice))
             qk += bias
 
         m_curr = qk.max(axis=-1)
@@ -105,7 +104,8 @@ def _fwd_kernel(
         l_curr = s_curr.sum(axis=-1)
         l_next = l_prev_corr + l_curr
         o_prev_corr = correction[:, None] * o_prev
-        v = pl.load(v_ref, (curr_k_slice, pl.dslice(block_d)))
+        # TODO: block_d ???
+        v = pl.load(v_ref, (k_slice, pl.dslice(block_d)))
         o_curr = pl.dot(s_curr.astype(v.dtype), v)
 
         o_next = o_prev_corr + o_curr
