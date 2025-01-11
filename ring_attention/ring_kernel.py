@@ -6,7 +6,7 @@ https://github.com/jax-ml/jax/blob/main/jax/experimental/pallas/ops/gpu/attentio
 
 Significant modifications have been made:
     1. support for arbitrary attention bias
-    2. simplify backward 
+    2. simplify backward kernel using atomic_add for computing query gradients.
     2. output block-wise stats and change interface for use in ring attention.
 
 The original copyright:
@@ -369,6 +369,8 @@ def _bwd_kernel(
         # Eliminate second loop over q by computing dq here and storing to write-contended
         # dq block with atomic add.
         dq = pl.dot(ds.astype(k_ref.dtype), k)
+        # TODO: does this atomic add have performance implicaitons? If so, get around by
+        # staggering the thread start blocks to avoid contention?
         pl.atomic_add(dq_ref, (curr_q_slice, slice(None)), dq)
 
         return dv, dk

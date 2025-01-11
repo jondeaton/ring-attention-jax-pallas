@@ -14,7 +14,7 @@ from jax.experimental import mesh_utils
 import einops
 from jaxtyping import Float, Int, Array
 
-from models.attention.ring import ring_attention, ring_self_attention
+from ring_attention.ring import ring_attention, ring_self_attention
 
 flags = os.environ.get("XLA_FLAGS", "")
 os.environ["XLA_FLAGS"] = flags + " --xla_force_host_platform_device_count=8"

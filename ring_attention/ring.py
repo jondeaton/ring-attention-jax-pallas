@@ -7,12 +7,19 @@ loads/stores to/from SRAM/HBM are replaced with rotations of query/key/value aro
 ring of devices which the sequences are shadred across.
 
 This implementation also supports a general mechamnism for incorporating arbitrary
-attention biases from a user-defined function, similar to Flex Attention [3].
+attention biases from a user-defined function, similar to Flex Attention [4]. Finally, 
+single-device attention block computaiton is performed with Pallas kernels heavily
+adopted from the implementations provided in the JAX repository [5].
 
-1. ring attention paper
-2. ring attention code https://github.com/haoliuhl/ringattention/blob/main/ringattention/ringattention_jax.py
-3. flash attention 2 paper
-4. flex attention
+References:
+1. Ring Attention with Blockwise Transformers for Near-Infinite Context Liu et al. 
+    https://arxiv.org/abs/2310.01889
+2. Ring Attention JAX code: https://github.com/haoliuhl/ringattention
+3. FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning. Tri
+    Dao https://arxiv.org/abs/2307.08691
+4. Flex Attention, https://pytorch.org/blog/flexattention/
+5. Pallas/JAX Flash attention implementation for Pallas kernels.
+    https://github.com/jax-ml/jax/blob/main/jax/experimental/pallas/ops/gpu/attention.py
 """
 
 from __future__ import annotations
@@ -290,7 +297,7 @@ def ring_attention(
         fwd_block_fn = _fwd_block
         bwd_block_fn = _bwd_block
     elif block_impl == "pallas":
-        from models.attention.ring_kernel import fwd_block, bwd_block
+        from .ring_kernel import fwd_block, bwd_block
 
         q_len = q.shape[1]
         k_len = k.shape[1]
