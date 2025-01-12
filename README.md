@@ -1,10 +1,10 @@
 # Ring Attention in JAX / Pallas with flexible attention.
 
 This is a JAX adaptation of the ring-attention algorithm introduced in [1] inspired by
-the original JAX implementation in [2]. The original code was adapted significantly
-to more closely resemble the Flash Attention 2 algorithm [3], but where the
-loads/stores to/from SRAM/HBM are replaced with rotations of query/key/value around the
-ring of devices which the sequences are shadred across.
+the original JAX implementation in [2]. The algorithm was adopted to more closely
+resemble Flash Attention 2 algorithm [3], but where movement of data between SRAM/HBM is
+replaced by rotations of query/key/value blocks around the ring of devices which the
+sequences are shadred across.
 
 This implementation also supports a general mechamnism for incorporating arbitrary
 attention biases from a user-defined function, similar to Flex Attention [4]. Finally, 
